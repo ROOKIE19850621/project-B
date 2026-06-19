@@ -5378,11 +5378,11 @@ function runInventorySyncAllAuto() {
     );
 
     _autoRunStep_(
-      'SP-API在庫取得失敗',
-      updateFbaInventoryFromSpApi
+      'FBA貼付在庫取得失敗',
+      updateStockSyncDFromFbaPaste_
     );
 
-    // 新規：eBay在庫0自動変更
+        // 新規：eBay在庫0自動変更
     var zeroResult =
       _autoRunStep_(
         'eBay在庫0自動変更失敗',
@@ -11904,4 +11904,181 @@ function verifyRecovery_RUN() {
   var out = [];
   for (var k in checks) out.push((checks[k] === 'function' ? '✅ ' : '❌ ') + k);
   Logger.log('=== 復旧確認 ===\n' + out.join('\n'));
+}
+
+/* ===================================================================
+ * v7 追加ブロック（安全版）  ファイルの「一番下」に貼り付けるだけ
+ * -------------------------------------------------------------------
+ * ・既存の AUTO_ 定数（AUTO_SHEET_STOCK_SYNC 等）を再利用します。
+ *   ここでは再定義しません（重複宣言エラー回避）。
+ * ・SKU正規化は専用の _autoNormSku_ を使用（_normSku_ の有無に依存しない）。
+ * ・在庫0変更には一切関与しません（D列の更新のみ）。
+ * =================================================================== */
+
+var FBA_PASTE_SS_ID        = '1zdEo_spDLplWVc2ddNUL5udeN8zeQcvZb9xIKqHw0dk';
+var FBA_PASTE_SHEET_NAME   = 'FBA在庫_貼付_';
+var FBA_PASTE_SHEET_GID    = 776037102;
+var FBA_PASTE_HEADER_SKU   = 'sellersku';
+var FBA_PASTE_HEADER_QTY   = 'fulfillablequantity';
+var FBA_PASTE_HEADER_SCAN_ROWS = 10;
+var FBA_PASTE_MARK_UNMATCHED   = true;
+
+
+function updateStockSyncDFromFbaPaste_() {
+  var srcSs = SpreadsheetApp.openById(FBA_PASTE_SS_ID);
+  var srcSheet = srcSs.getSheetByName(FBA_PASTE_SHEET_NAME);
+  if (!srcSheet) {
+    var sheets = srcSs.getSheets();
+    for (var s = 0; s < sheets.length; s++) {
+      if (sheets[s].getSheetId() === FBA_PASTE_SHEET_GID) { srcSheet = sheets[s]; break; }
+    }
+  }
+  if (!srcSheet) {
+    throw new Error('FBA paste sheet not found (D column kept)');
+  }
+
+  var srcValues = srcSheet.getDataRange().getValues();
+  if (!srcValues || srcValues.length < 2) {
+    throw new Error('FBA paste sheet has no data rows (D column kept)');
+  }
+
+  var headerRowIdx = -1, skuCol = -1, qtyCol = -1;
+  var scanMax = Math.min(FBA_PASTE_HEADER_SCAN_ROWS, srcValues.length);
+  for (var r = 0; r < scanMax; r++) {
+    var hdr = srcValues[r].map(function (x) {
+      return String(x == null ? '' : x).trim().toLowerCase();
+    });
+    var si = hdr.indexOf(FBA_PASTE_HEADER_SKU);
+    var qi = hdr.indexOf(FBA_PASTE_HEADER_QTY);
+    if (si !== -1 && qi !== -1) { headerRowIdx = r; skuCol = si; qtyCol = qi; break; }
+  }
+  if (headerRowIdx === -1) {
+    throw new Error('FBA paste header mismatch (D column kept)');
+  }
+
+  var qtyMap = {};
+  for (var i = headerRowIdx + 1; i < srcValues.length; i++) {
+    var nsku = _autoNormSku_(srcValues[i][skuCol]);
+    if (!nsku) continue;
+    var q = Number(srcValues[i][qtyCol]);
+    qtyMap[nsku] = isNaN(q) ? '' : q;
+  }
+
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(AUTO_SHEET_STOCK_SYNC);
+  if (!sheet) throw new Error('Sheet not found: ' + AUTO_SHEET_STOCK_SYNC);
+
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) {
+    Logger.log('Stock sync sheet has no data rows');
+    return { matched: 0, unmatched: 0, processed: 0 };
+  }
+
+  var numRows = lastRow - 1;
+  var skuColVals = sheet.getRange(2, AUTO_COL_SKU, numRows, 1).getValues();
+  var dCol  = sheet.getRange(2, AUTO_COL_AMZ_QTY, numRows, 1).getValues();
+  var hiCol = sheet.getRange(2, AUTO_COL_LASTCHECK, numRows, 2).getValues();
+
+  var now = _autoNowStr_();
+  var matched = 0, unmatched = 0, processed = 0;
+
+  for (var k = 0; k < numRows; k++) {
+    var sku = String(skuColVals[k][0] == null ? '' : skuColVals[k][0]).trim();
+    if (!sku) continue;
+    if (AUTO_SKU_EXCLUDE.indexOf(sku.toUpperCase()) !== -1) continue;
+    if (_autoIsTestSku_(sku)) continue;
+
+    processed++;
+    var nsku = _autoNormSku_(sku);
+
+    if (qtyMap.hasOwnProperty(nsku)) {
+      dCol[k][0]  = qtyMap[nsku];
+      hiCol[k][0] = now;
+      hiCol[k][1] = 'FBA貼付取得済';
+      matched++;
+    } else {
+      if (FBA_PASTE_MARK_UNMATCHED) {
+        hiCol[k][0] = now;
+        hiCol[k][1] = 'FBA貼付未発見';
+      }
+      unmatched++;
+    }
+  }
+
+  sheet.getRange(2, AUTO_COL_AMZ_QTY, numRows, 1).setValues(dCol);
+  sheet.getRange(2, AUTO_COL_LASTCHECK, numRows, 2).setValues(hiCol);
+
+  Logger.log('FBA paste to D column: matched=' + matched + ' unmatched=' + unmatched + ' processed=' + processed);
+  return { matched: matched, unmatched: unmatched, processed: processed };
+}
+
+
+function dryRunFbaPasteLookup_RUN() {
+  var srcSs = SpreadsheetApp.openById(FBA_PASTE_SS_ID);
+  var srcSheet = srcSs.getSheetByName(FBA_PASTE_SHEET_NAME);
+  if (!srcSheet) {
+    var sheets = srcSs.getSheets();
+    for (var s = 0; s < sheets.length; s++) {
+      if (sheets[s].getSheetId() === FBA_PASTE_SHEET_GID) { srcSheet = sheets[s]; break; }
+    }
+  }
+  if (!srcSheet) { Logger.log('NG: source sheet not found'); return; }
+
+  var srcValues = srcSheet.getDataRange().getValues();
+  var headerRowIdx = -1, skuCol = -1, qtyCol = -1;
+  var scanMax = Math.min(FBA_PASTE_HEADER_SCAN_ROWS, srcValues.length);
+  for (var r = 0; r < scanMax; r++) {
+    var hdr = srcValues[r].map(function (x) { return String(x == null ? '' : x).trim().toLowerCase(); });
+    var si = hdr.indexOf(FBA_PASTE_HEADER_SKU);
+    var qi = hdr.indexOf(FBA_PASTE_HEADER_QTY);
+    if (si !== -1 && qi !== -1) { headerRowIdx = r; skuCol = si; qtyCol = qi; break; }
+  }
+  if (headerRowIdx === -1) { Logger.log('NG: header mismatch'); return; }
+
+  var qtyMap = {};
+  for (var i = headerRowIdx + 1; i < srcValues.length; i++) {
+    var nsku = _autoNormSku_(srcValues[i][skuCol]);
+    if (!nsku) continue;
+    qtyMap[nsku] = srcValues[i][qtyCol];
+  }
+
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(AUTO_SHEET_STOCK_SYNC);
+  var lastRow = sheet.getLastRow();
+  var numRows = lastRow - 1;
+  var skuColVals = sheet.getRange(2, AUTO_COL_SKU, numRows, 1).getValues();
+
+  var matched = 0, unmatched = 0, processed = 0, samples = [];
+  for (var k = 0; k < numRows; k++) {
+    var sku = String(skuColVals[k][0] == null ? '' : skuColVals[k][0]).trim();
+    if (!sku) continue;
+    if (AUTO_SKU_EXCLUDE.indexOf(sku.toUpperCase()) !== -1) continue;
+    if (_autoIsTestSku_(sku)) continue;
+    processed++;
+    var nsku = _autoNormSku_(sku);
+    if (qtyMap.hasOwnProperty(nsku)) {
+      matched++;
+      if (samples.length < 10) samples.push(sku + ' -> ' + qtyMap[nsku]);
+    } else {
+      unmatched++;
+    }
+  }
+
+  Logger.log('=== DRY-RUN (no write) ===');
+  Logger.log('source headerRow=' + (headerRowIdx + 1) + ' skuCol=' + (skuCol + 1) + ' qtyCol=' + (qtyCol + 1));
+  Logger.log('processed=' + processed + ' matched=' + matched + ' unmatched=' + unmatched);
+  Logger.log('--- matched samples (max 10) ---\n' + (samples.length ? samples.join('\n') : '(none)'));
+}
+
+
+function _autoNormSku_(sku) {
+  if (typeof normalizeSku_ === 'function') {
+    try { return normalizeSku_(sku); } catch (e) {}
+  }
+  return String(sku == null ? '' : sku).trim();
+}
+
+function applyFbaPasteToDColumn_RUN() {
+  var r = updateStockSyncDFromFbaPaste_();
+  Logger.log('result: ' + JSON.stringify(r));
 }
