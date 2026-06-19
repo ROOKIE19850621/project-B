@@ -11885,3 +11885,23 @@ function getMcfSpApiAccessToken_() {
 function sampleCsvProps_() {
   return PropertiesService.getScriptProperties();
 }
+
+function verifyRecovery_RUN() {
+  var checks = {
+    sendLine: typeof sendLine,
+    updateEbayRawFromTradingApi: typeof updateEbayRawFromTradingApi,
+    updateStockSyncFromEbayRaw: typeof updateStockSyncFromEbayRaw,
+    updateFbaInventoryFromSpApi: typeof updateFbaInventoryFromSpApi,
+    applyFbaToEbayZeroAuto_: typeof applyFbaToEbayZeroAuto_,
+    autoCreateMcfOrders: typeof autoCreateMcfOrders,
+    checkEbayOrders: typeof checkEbayOrders,
+    checkMcfTrackingNumbersAuto: typeof checkMcfTrackingNumbersAuto,
+    runMcfAnomalyMonitor: typeof runMcfAnomalyMonitor,
+    publishSampleCsvListingNow_Integrated: typeof publishSampleCsvListingNow_Integrated,
+    sampleCsvProps_: typeof sampleCsvProps_,
+    runInventorySyncAllAuto: typeof runInventorySyncAllAuto
+  };
+  var out = [];
+  for (var k in checks) out.push((checks[k] === 'function' ? '✅ ' : '❌ ') + k);
+  Logger.log('=== 復旧確認 ===\n' + out.join('\n'));
+}
