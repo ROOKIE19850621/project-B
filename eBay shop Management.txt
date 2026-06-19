@@ -1,267 +1,569 @@
-function onOpen() {
-  SpreadsheetApp.getUi()
-    .createMenu('発送管理')
-    .addItem('管理番号を発送済荷物B列へ追加', 'copyShipmentNumbersToDoneSheetColumnB')
-    .addToUi();
-}
+/**
+ * InventoryAutoRun.gs  （自動運用 v7）
+ * ===============================================================
+ * 在庫同期システムの「完全自動運用」関数群。
+ *
+ * 【v6 → v7 の変更点】
+ *  ① SP-API在庫取得（updateFbaInventoryFromSpApi）の呼び出しを廃止し、
+ *     代わりに「日次同期済みの別スプレッドシート（FBA在庫_貼付_）」から
+ *     在庫同期管理シートの D列(Amazon在庫) を更新する方式に変更。
+ *       → 新関数: updateStockSyncDFromFbaPaste_()
+ *  ② eBay在庫0自動変更（applyFbaToEbayZeroAuto_）の呼び出しを「停止」。
+ *       理由：在庫0変更は eBay への実書き込み。明示承認 + DRY_RUN 確認前は
+ *             一切動かさない方針のため、本ファイルからは呼ばない。
+ *       → 再有効化は、下部のコメント解除 + 利用者の明示承認後のみ。
+ *  ③ 自己診断 validateInventorySyncResult_() が、新方式の確認結果文字列
+ *       'FBA貼付取得済' / 'FBA貼付未発見' も認識するよう拡張。
+ *
+ * 既存関数を呼び出すだけ（再定義しない）：
+ *   updateEbayRawFromTradingApi() / updateStockSyncFromEbayRaw() / sendLine()
+ *   _normSku_()  ← SpApiInventory.gs 等に定義済みの正規化関数を流用
+ *
+ * 【定数の衝突回避】このファイル独自の AUTO_ 接頭辞付き定数を使用する。
+ *
+ * 禁止：setEbayQuantityZero / ReviseFixedPriceItem / checkFbaInventory
+ *   → eBay在庫は一切変更しない（取得・判定・LINE通知のみ）
+ * ===============================================================
+ */
+
+// ===== このファイル専用の定数（v4と名前が衝突しないよう AUTO_ 接頭辞）=====
+var AUTO_SHEET_STOCK_SYNC = '在庫同期管理';
+
+var AUTO_COL_SKU       = 1; // A
+var AUTO_COL_AMZ_QTY   = 4; // D Amazon在庫
+var AUTO_COL_EBAY_QTY  = 5; // E eBay設定在庫
+var AUTO_COL_THRESHOLD = 6; // F 通知基準数
+var AUTO_COL_LASTCHECK = 8; // H 最終確認日時
+var AUTO_COL_RESULT    = 9; // I 確認結果
+
+var AUTO_SKU_EXCLUDE = ['SKU', 'WAREHOUSES', 'DELETED', 'ITEMID', 'TITLE', 'AVAILABLEQUANTITY'];
+
+// テスト用SKU（在庫同期の対象から除外する）。
+var AUTO_TEST_SKU_TOKENS = ['SAMPLE', 'TEST', 'DUMMY'];
+
+// 旧方式トリガー（残存していたら警告）
+var AUTO_LEGACY_TRIGGER_FUNCS = [
+  'checkFbaInventory',
+  'setupInventoryTrigger',
+  'setupInventorySyncTrigger',
+  'setEbayQuantityZero'
+];
+
+// ===== ★v7新規：FBA在庫_貼付_（日次同期済み・別スプレッドシート）参照設定 =====
+var FBA_PASTE_SS_ID        = '1zdEo_spDLplWVc2ddNUL5udeN8zeQcvZb9xIKqHw0dk'; // 売上管理ブック
+var FBA_PASTE_SHEET_NAME   = 'FBA在庫_貼付_';   // 主：シート名で取得
+var FBA_PASTE_SHEET_GID    = 776037102;          // 副：名前不一致時のフォールバック(gid)
+var FBA_PASTE_HEADER_SKU   = 'sellersku';            // ヘッダー（小文字比較）
+var FBA_PASTE_HEADER_QTY   = 'fulfillablequantity';  // ヘッダー（小文字比較）
+var FBA_PASTE_HEADER_SCAN_ROWS = 10;             // ヘッダー行を探索する最大行数
+
+// 不一致SKUの扱い：true=I列に「FBA貼付未発見」を記録（旧SP-API版と同じ自己診断挙動）
+//                 false=不一致行は一切触れない（非FBA出品で誤アラートを避けたい場合）
+var FBA_PASTE_MARK_UNMATCHED = true;
+
 
 /**
- * 指定した管理番号を発送済荷物B列へ追加し、
- * 同じL列の貨物内に食品があればメール下書きを作成する。
+ * 自動一括実行（v7）
+ *
+ * eBayRaw取得
+ * ↓
+ * 在庫同期管理更新（eBayRaw → 在庫同期管理）
+ * ↓
+ * ★FBA貼付参照で D列(Amazon在庫) 更新（SP-APIは使わない）
+ * ↓
+ * （eBay在庫0自動変更は v7 で停止中）
+ * ↓
+ * 自己診断
+ * ↓
+ * LINE通知
  */
-function copyShipmentNumbersToDoneSheetColumnB() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const ui = SpreadsheetApp.getUi();
-  const sourceSheet = ss.getSheetByName('発送予定_荷姿確定');
+function runInventorySyncAllAuto() {
+  var lock = LockService.getScriptLock();
 
-  if (!sourceSheet) {
-    throw new Error('発送予定_荷姿確定 シートが見つかりません。');
-  }
-
-  let destSheet = ss.getSheetByName('発送済荷物');
-  if (!destSheet) destSheet = ss.insertSheet('発送済荷物');
-
-  const response = ui.prompt(
-    '発送済荷物へ追加',
-    '追加する管理番号を入力してください。\n複数の場合はスペース区切りです。',
-    ui.ButtonSet.OK_CANCEL
-  );
-
-  if (response.getSelectedButton() !== ui.Button.OK) return;
-
-  const targetNumbers = [...new Set(
-    response.getResponseText().trim().split(/\s+/).filter(Boolean)
-  )];
-
-  if (targetNumbers.length === 0) {
-    ui.alert('管理番号が入力されていません。');
+  if (!lock.tryLock(10 * 1000)) {
+    Logger.log('別の実行が進行中のためスキップ');
     return;
   }
 
-  const lastRow = sourceSheet.getLastRow();
+  try {
+    _autoRunStep_('eBayRaw取得失敗', updateEbayRawFromTradingApi);
+
+    _autoRunStep_('在庫同期更新失敗', updateStockSyncFromEbayRaw);
+
+    // ★v7：SP-API在庫取得をやめ、FBA貼付シートから D列 を更新
+    _autoRunStep_('FBA貼付在庫取得失敗', updateStockSyncDFromFbaPaste_);
+
+    // ===== v7：eBay在庫0自動変更は停止中 =====
+    // 在庫0変更は eBay への実書き込みのため、明示承認 + DRY_RUN 確認まで呼ばない。
+    // 再有効化する場合は、下記2行のコメントを解除する（利用者承認後のみ）。
+    // var zeroResult = _autoRunStep_('eBay在庫0自動変更失敗', applyFbaToEbayZeroAuto_);
+    var zeroResult = null;
+
+    var v = validateInventorySyncResult_();
+
+    if (v.sysAbnormal) {
+      sendLine(_autoBuildSystemErrorMessage_(v));
+
+    } else if (zeroResult && (zeroResult.successCount > 0 || zeroResult.failureCount > 0)) {
+      sendLine(buildFbaZeroAutoLineMessage_(zeroResult));
+
+    } else if (v.hasStockAlert) {
+      sendLine(_autoBuildStockAlertMessage_(v));
+
+    } else {
+      // 正常（変更・アラートなし）：LINE通知せずログのみ
+      Logger.log('ℹ️ 在庫同期はすべて正常（変更・アラートなし）のため、LINE通知をスキップしました。');
+      Logger.log(_autoBuildOkMessage_(v));
+    }
+
+  } catch (e) {
+    var stage = e && e._stage ? e._stage : 'GAS実行エラー';
+    var emsg  = e && e.message ? e.message : String(e);
+    var msg = '❌ 在庫同期 システム異常\n\n'
+      + '【異常内容】\n' + stage
+      + '\nエラー: ' + emsg
+      + '\n\n時刻: ' + _autoNowStr_();
+
+    try { sendLine(msg); } catch (e2) { Logger.log('LINE送信失敗: ' + e2); }
+    Logger.log('runInventorySyncAllAuto エラー[' + stage + ']: ' + e);
+
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+
+/**
+ * ★v7新規：FBA在庫_貼付_（別ブック・日次同期済み）→ 在庫同期管理 D列 を更新
+ *
+ * - ソース：FBA_PASTE_SS_ID の FBA_PASTE_SHEET_NAME（無ければ gid で探す）
+ * - ヘッダーを自動判別（sku / afn-fulfillable-quantity を含む行を探索）
+ * - SKU を _normSku_ で対称化して突合
+ * - 一致：D列=在庫数, H列=日時, I列='FBA貼付取得済'
+ * - 不一致：FBA_PASTE_MARK_UNMATCHED=true のとき I列='FBA貼付未発見'
+ *
+ * 安全側設計：ソースが見つからない/ヘッダー不一致のときは throw して
+ *            既存の D列 を上書き消去しない。
+ */
+function updateStockSyncDFromFbaPaste_() {
+  // --- 1) ソースシート取得（名前 → gid フォールバック）---
+  var srcSs = SpreadsheetApp.openById(FBA_PASTE_SS_ID);
+  var srcSheet = srcSs.getSheetByName(FBA_PASTE_SHEET_NAME);
+  if (!srcSheet) {
+    var sheets = srcSs.getSheets();
+    for (var s = 0; s < sheets.length; s++) {
+      if (sheets[s].getSheetId() === FBA_PASTE_SHEET_GID) { srcSheet = sheets[s]; break; }
+    }
+  }
+  if (!srcSheet) {
+    throw new Error('FBA貼付シート未発見: ' + FBA_PASTE_SHEET_NAME
+      + ' / gid=' + FBA_PASTE_SHEET_GID + '（在庫同期管理D列は保持）');
+  }
+
+  // --- 2) ヘッダー自動判別 ---
+  var srcValues = srcSheet.getDataRange().getValues();
+  if (!srcValues || srcValues.length < 2) {
+    throw new Error('FBA貼付シートにデータ行がありません（在庫同期管理D列は保持）');
+  }
+  var headerRowIdx = -1, skuCol = -1, qtyCol = -1;
+  var scanMax = Math.min(FBA_PASTE_HEADER_SCAN_ROWS, srcValues.length);
+  for (var r = 0; r < scanMax; r++) {
+    var hdr = srcValues[r].map(function (x) {
+      return String(x == null ? '' : x).trim().toLowerCase();
+    });
+    var si = hdr.indexOf(FBA_PASTE_HEADER_SKU);
+    var qi = hdr.indexOf(FBA_PASTE_HEADER_QTY);
+    if (si !== -1 && qi !== -1) { headerRowIdx = r; skuCol = si; qtyCol = qi; break; }
+  }
+  if (headerRowIdx === -1) {
+    throw new Error('FBA貼付ヘッダー不一致: "' + FBA_PASTE_HEADER_SKU + '" / "'
+      + FBA_PASTE_HEADER_QTY + '" が見つかりません（在庫同期管理D列は保持）');
+  }
+
+  // --- 3) SKU→在庫 マップ作成（_normSku_ で対称化）---
+  var qtyMap = {};
+  for (var i = headerRowIdx + 1; i < srcValues.length; i++) {
+    var nsku = _normSku_(srcValues[i][skuCol]);
+    if (!nsku) continue;
+    var q = Number(srcValues[i][qtyCol]);
+    qtyMap[nsku] = isNaN(q) ? '' : q;   // 数値化できない値は空扱い
+  }
+
+  // --- 4) 在庫同期管理 へ反映 ---
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(AUTO_SHEET_STOCK_SYNC);
+  if (!sheet) throw new Error('シートが見つかりません: ' + AUTO_SHEET_STOCK_SYNC);
+
+  var lastRow = sheet.getLastRow();
   if (lastRow < 2) {
-    ui.alert('発送予定_荷姿確定 シートにデータがありません。');
-    return;
+    Logger.log('在庫同期管理にデータ行なし');
+    return { matched: 0, unmatched: 0, processed: 0 };
   }
 
-  const sourceData = sourceSheet
-    .getRange(2, 1, lastRow - 1, 15)
-    .getDisplayValues();
+  var numRows = lastRow - 1;
+  var skuColVals = sheet.getRange(2, AUTO_COL_SKU, numRows, 1).getValues();
+  var dCol  = sheet.getRange(2, AUTO_COL_AMZ_QTY, numRows, 1).getValues();    // D
+  var hiCol = sheet.getRange(2, AUTO_COL_LASTCHECK, numRows, 2).getValues();  // H,I
 
-  const rowsByNumber = new Map();
-  sourceData.forEach(row => {
-    const number = String(row[0] || '').trim();
-    if (number && !rowsByNumber.has(number)) rowsByNumber.set(number, row);
-  });
+  var now = _autoNowStr_();
+  var matched = 0, unmatched = 0, processed = 0;
 
-  const notFound = targetNumbers.filter(number => !rowsByNumber.has(number));
-  if (notFound.length > 0) {
-    ui.alert(
-      '発送予定_荷姿確定 のA列に見つからない管理番号があります。\n\n' +
-      notFound.join(' ') + '\n\n処理を中止しました。'
-    );
-    return;
-  }
+  for (var k = 0; k < numRows; k++) {
+    var sku = String(skuColVals[k][0] == null ? '' : skuColVals[k][0]).trim();
+    if (!sku) continue;
+    if (AUTO_SKU_EXCLUDE.indexOf(sku.toUpperCase()) !== -1) continue;
+    if (_autoIsTestSku_(sku)) continue;
 
-  const confirm = ui.alert(
-    '追加確認',
-    '以下を発送済荷物B列へ追加します。\n\n' + targetNumbers.join('\n'),
-    ui.ButtonSet.YES_NO
-  );
-  if (confirm !== ui.Button.YES) return;
+    processed++;
+    var nsku = _normSku_(sku);
 
-  const startRow = getLastNonEmptyRowInColumn_(destSheet, 2) + 1;
-  destSheet
-    .getRange(startRow, 2, targetNumbers.length, 1)
-    .setValues(targetNumbers.map(number => [number]));
-
-  const foodTargetNumbers = targetNumbers.filter(number => {
-    return getFoodBoxInfo_(rowsByNumber.get(number), sourceData).matched;
-  });
-
-  let draftMessage = '\n\n同じ貨物内に食品がないため、下書き対象外です。';
-  if (foodTargetNumbers.length > 0) {
-    try {
-      // 取得済みデータを渡し、発送予定_荷姿確定の再読み込みを避ける。
-      createFoodShipmentDraft_(foodTargetNumbers, sourceData);
-      draftMessage = '\n\n食品を含むため、メール下書きを作成しました。';
-    } catch (error) {
-      draftMessage = '\n\nメール下書きを作成できませんでした。\nエラー: ' + error.message;
+    if (qtyMap.hasOwnProperty(nsku)) {
+      dCol[k][0]  = qtyMap[nsku];     // D Amazon在庫
+      hiCol[k][0] = now;              // H 最終確認日時
+      hiCol[k][1] = 'FBA貼付取得済';  // I 確認結果
+      matched++;
+    } else {
+      if (FBA_PASTE_MARK_UNMATCHED) {
+        hiCol[k][0] = now;
+        hiCol[k][1] = 'FBA貼付未発見';
+        // D列は上書きしない（既存値を保持）
+      }
+      unmatched++;
     }
   }
 
-  ui.alert(
-    '追加完了しました。\n\n追加件数: ' + targetNumbers.length + '件\n\n' +
-    targetNumbers.join(' ') + draftMessage
-  );
+  sheet.getRange(2, AUTO_COL_AMZ_QTY, numRows, 1).setValues(dCol);
+  sheet.getRange(2, AUTO_COL_LASTCHECK, numRows, 2).setValues(hiCol);
+
+  Logger.log('FBA貼付→在庫同期D列 反映: 一致=' + matched
+    + ' / 不一致=' + unmatched + ' / 処理=' + processed
+    + '（ヘッダー行=' + (headerRowIdx + 1) + ', SKU列=' + (skuCol + 1)
+    + ', 在庫列=' + (qtyCol + 1) + '）');
+
+  return { matched: matched, unmatched: unmatched, processed: processed };
 }
 
-/** L列が同じ行を同じ貨物として、O列に「食品」があるか判定する。 */
-function getFoodBoxInfo_(representativeRow, allRows) {
-  const groupValue = String(representativeRow[11] || '').trim();
-  const boxRows = groupValue
-    ? allRows.filter(row => String(row[11] || '').trim() === groupValue)
-    : [representativeRow];
-
-  const foodRows = boxRows.filter(row => {
-    return String(row[14] || '').trim() === '食品';
-  });
-
-  return {
-    matched: foodRows.length > 0,
-    groupValue: groupValue,
-    boxRows: boxRows,
-    foodNumbers: foodRows
-      .map(row => String(row[0] || '').trim())
-      .filter(Boolean)
-  };
-}
 
 /**
- * 発送予定のA列から代表管理番号を特定し、AQ列・AS列を本文へ入れる。
- * 件名は発送予定_荷姿確定の代表管理番号行にあるL列の値。
+ * ★v7新規：単体テスト用（在庫同期管理には書き込まない・件数だけ確認）
+ * 本番反映前の安全確認に使用する。
  */
-function createFoodShipmentDraft_(shipmentNumbers, sourceData) {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const shapeSheet = ss.getSheetByName('発送予定_荷姿確定');
-  const trackingSpreadsheet = SpreadsheetApp.openById(
-    '1_PqYPsK8GxSuFJ_Fq_FheExl8-xjHoq2JnpKIZ9zTus'
-  );
-  const shippingSheet = trackingSpreadsheet.getSheetByName('進捗管理');
+function dryRunFbaPasteLookup_RUN() {
+  var srcSs = SpreadsheetApp.openById(FBA_PASTE_SS_ID);
+  var srcSheet = srcSs.getSheetByName(FBA_PASTE_SHEET_NAME);
+  if (!srcSheet) {
+    var sheets = srcSs.getSheets();
+    for (var s = 0; s < sheets.length; s++) {
+      if (sheets[s].getSheetId() === FBA_PASTE_SHEET_GID) { srcSheet = sheets[s]; break; }
+    }
+  }
+  if (!srcSheet) { Logger.log('❌ ソースシート未発見'); return; }
 
-  if (!shapeSheet) throw new Error('発送予定_荷姿確定 シートが見つかりません。');
-  if (!shippingSheet) throw new Error('進捗管理 シートが見つかりません。');
+  var srcValues = srcSheet.getDataRange().getValues();
+  var headerRowIdx = -1, skuCol = -1, qtyCol = -1;
+  var scanMax = Math.min(FBA_PASTE_HEADER_SCAN_ROWS, srcValues.length);
+  for (var r = 0; r < scanMax; r++) {
+    var hdr = srcValues[r].map(function (x) { return String(x == null ? '' : x).trim().toLowerCase(); });
+    var si = hdr.indexOf(FBA_PASTE_HEADER_SKU);
+    var qi = hdr.indexOf(FBA_PASTE_HEADER_QTY);
+    if (si !== -1 && qi !== -1) { headerRowIdx = r; skuCol = si; qtyCol = qi; break; }
+  }
+  if (headerRowIdx === -1) { Logger.log('❌ ヘッダー不一致'); return; }
 
-  const targetSet = new Set(shipmentNumbers.map(number => String(number).trim()));
-  // 通常処理では呼び出し元の取得済みデータを再利用する。
-  // 単独実行時だけシートを読み込む。
-  const shapeData = sourceData || shapeSheet
-    .getRange(2, 1, shapeSheet.getLastRow() - 1, 15)
-    .getDisplayValues();
-
-  // 発送予定_荷姿確定で、A列が入力番号に一致しN列が空白でない行を代表行とする。
-  const representativeShapeRow = shapeData.find(row => {
-    const numberA = String(row[0] || '').trim();
-    const valueN = String(row[13] || '').trim();
-    return targetSet.has(numberA) && valueN !== '';
-  });
-
-  if (!representativeShapeRow) {
-    throw new Error('発送予定_荷姿確定に、A列一致・N列非空白の代表行がありません。');
+  var qtyMap = {};
+  for (var i = headerRowIdx + 1; i < srcValues.length; i++) {
+    var nsku = _normSku_(srcValues[i][skuCol]);
+    if (!nsku) continue;
+    qtyMap[nsku] = srcValues[i][qtyCol];
   }
 
-  const representativeNumber = String(representativeShapeRow[0] || '').trim();
-  const subject = String(representativeShapeRow[11] || '').trim(); // L列
-  if (!subject) throw new Error('代表管理番号行のL列が空白です。');
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(AUTO_SHEET_STOCK_SYNC);
+  var lastRow = sheet.getLastRow();
+  var numRows = lastRow - 1;
+  var skuColVals = sheet.getRange(2, AUTO_COL_SKU, numRows, 1).getValues();
 
-  const shippingLastRow = shippingSheet.getLastRow();
-  if (shippingLastRow < 2) throw new Error('進捗管理 シートにデータがありません。');
-
-  // 全45列を読み込まず、A列で代表管理番号の行だけを直接検索する。
-  const matchingCells = shippingSheet
-    .getRange(2, 1, shippingLastRow - 1, 1)
-    .createTextFinder(representativeNumber)
-    .matchEntireCell(true)
-    .findAll();
-
-  if (matchingCells.length === 0) {
-    throw new Error('進捗管理のA列に代表管理番号がありません: ' + representativeNumber);
+  var matched = 0, unmatched = 0, processed = 0, samples = [];
+  for (var k = 0; k < numRows; k++) {
+    var sku = String(skuColVals[k][0] == null ? '' : skuColVals[k][0]).trim();
+    if (!sku) continue;
+    if (AUTO_SKU_EXCLUDE.indexOf(sku.toUpperCase()) !== -1) continue;
+    if (_autoIsTestSku_(sku)) continue;
+    processed++;
+    var nsku = _normSku_(sku);
+    if (qtyMap.hasOwnProperty(nsku)) {
+      matched++;
+      if (samples.length < 10) samples.push(sku + ' → 在庫' + qtyMap[nsku]);
+    } else {
+      unmatched++;
+    }
   }
 
-  let trackingNumber = '';
-  let entryNumber = '';
-  for (const cell of matchingCells) {
-    const values = shippingSheet
-      .getRange(cell.getRow(), 43, 1, 3)
-      .getDisplayValues()[0];
-    if (!trackingNumber) trackingNumber = String(values[0] || '').trim();
-    if (!entryNumber) entryNumber = String(values[2] || '').trim();
-    if (trackingNumber && entryNumber) break;
-  }
-
-  const body = [
-    '追跡番号：' + (trackingNumber || '未設定'),
-    'エントリー番号：' + (entryNumber || '未設定'),
-    '',
-    'paperwork@fedex.com',
-    'をあて先に入れる',
-    '',
-    'G:\\マイドライブ\\SKYCREW_Japan\\S_送り状',
-    'から追跡番号に該当するファイルを添付してください'
-  ].join('\n');
-
-  GmailApp.createDraft('shinicchee@gmail.com', subject, body);
+  Logger.log('=== DRY-RUN（書き込みなし）===');
+  Logger.log('ソース ヘッダー行=' + (headerRowIdx + 1) + ', SKU列=' + (skuCol + 1) + ', 在庫列=' + (qtyCol + 1));
+  Logger.log('在庫同期管理 処理対象=' + processed + ' / 一致=' + matched + ' / 不一致=' + unmatched);
+  Logger.log('--- 一致サンプル（最大10件）---\n' + (samples.length ? samples.join('\n') : '（なし）'));
 }
 
-/** B列へ追記せず、食品判定だけを確認する。 */
-function debugFoodDraftConditions() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const ui = SpreadsheetApp.getUi();
-  const sheet = ss.getSheetByName('発送予定_荷姿確定');
-  if (!sheet) throw new Error('発送予定_荷姿確定 シートが見つかりません。');
 
-  const response = ui.prompt(
-    '食品判定デバッグ',
-    '管理番号を入力してください。複数の場合はスペース区切りです。',
-    ui.ButtonSet.OK_CANCEL
-  );
-  if (response.getSelectedButton() !== ui.Button.OK) return;
-
-  const numbers = [...new Set(
-    response.getResponseText().trim().split(/\s+/).filter(Boolean)
-  )];
-  if (numbers.length === 0) return;
-
-  const data = sheet
-    .getRange(2, 1, sheet.getLastRow() - 1, 15)
-    .getDisplayValues();
-  const rowsByNumber = new Map();
-  data.forEach(row => {
-    const number = String(row[0] || '').trim();
-    if (number && !rowsByNumber.has(number)) rowsByNumber.set(number, row);
-  });
-
-  const results = numbers.map(number => {
-    const row = rowsByNumber.get(number);
-    if (!row) return number + ': A列に見つかりません';
-    const info = getFoodBoxInfo_(row, data);
-    return number +
-      ': L列=[' + info.groupValue + ']' +
-      ', 同貨物行数=' + info.boxRows.length +
-      ', 食品管理番号=[' + info.foodNumbers.join(' ') + ']' +
-      ', 対象=' + (info.matched ? 'はい' : 'いいえ');
-  });
-
-  results.forEach(result => console.log(result));
-  ui.alert('食品判定結果', results.join('\n'), ui.ButtonSet.OK);
-}
-
-/** B列へ追記せず、実在する管理番号でメール下書きだけをテストする。 */
-function debugCreateGmailDraft() {
-  const ui = SpreadsheetApp.getUi();
-  const response = ui.prompt(
-    'Gmail下書きテスト',
-    '管理番号を入力してください。複数の場合はスペース区切りです。',
-    ui.ButtonSet.OK_CANCEL
-  );
-  if (response.getSelectedButton() !== ui.Button.OK) return;
-
-  const numbers = response.getResponseText().trim().split(/\s+/).filter(Boolean);
-  if (numbers.length === 0) return;
-
+/**
+ * ステップ実行ラッパー（戻り値を呼出元へ返す）
+ */
+function _autoRunStep_(stageLabel, fn) {
   try {
-    createFoodShipmentDraft_(numbers);
-    ui.alert('Gmail下書きテスト成功');
-  } catch (error) {
-    console.error(error.stack || error);
-    ui.alert('Gmail下書きテスト失敗\n\n' + error.message);
+    return fn();
+  } catch (e) {
+    var wrapped = new Error(e && e.message ? e.message : String(e));
+    wrapped._stage = stageLabel;
+    throw wrapped;
   }
 }
 
-/** 指定列の最終入力行を取得する。 */
-function getLastNonEmptyRowInColumn_(sheet, columnNumber) {
-  const bottomCell = sheet.getRange(sheet.getMaxRows(), columnNumber);
-  const lastCell = bottomCell.getNextDataCell(SpreadsheetApp.Direction.UP);
-  const value = String(lastCell.getDisplayValue() || '').trim();
-  return value === '' ? 0 : lastCell.getRow();
+
+/**
+ * 【2】在庫同期管理シートの自己診断
+ * 対象：eBay設定在庫(E) >= 1 のSKU
+ *
+ * v7：確認結果の「取得済 / 未発見」判定に、
+ *     新方式の 'FBA貼付取得済' / 'FBA貼付未発見' を追加認識。
+ */
+function validateInventorySyncResult_() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(AUTO_SHEET_STOCK_SYNC);
+
+  var v = {
+    sysAbnormal: false,
+    hasStockAlert: false,
+    fatal: null,
+    counts: {
+      target: 0, got: 0, single: 0,
+      missing: 0, amzBlank: 0, resultBlank: 0, lastCheckBlank: 0,
+      amzZero: 0, lowStock: 0, ebayOver: 0
+    },
+    sysIssues: [],
+    stockIssues: []
+  };
+
+  if (!sheet) {
+    v.sysAbnormal = true;
+    v.fatal = 'シートが見つかりません: ' + AUTO_SHEET_STOCK_SYNC;
+    return v;
+  }
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return v;
+
+  var numRows = lastRow - 1;
+  var data = sheet.getRange(2, 1, numRows, 9).getValues();
+
+  for (var i = 0; i < data.length; i++) {
+    var row = data[i];
+    var sku = String(row[AUTO_COL_SKU - 1] == null ? '' : row[AUTO_COL_SKU - 1]).trim();
+    if (!sku) continue;
+    if (AUTO_SKU_EXCLUDE.indexOf(sku.toUpperCase()) !== -1) continue;
+    if (_autoIsTestSku_(sku)) continue;
+
+    var ebayQty = _autoToNum_(row[AUTO_COL_EBAY_QTY - 1]);
+    if (!(ebayQty >= 1)) continue;
+
+    v.counts.target++;
+
+    var amzRaw    = row[AUTO_COL_AMZ_QTY - 1];
+    var amzBlank  = (amzRaw === '' || amzRaw === null || amzRaw === undefined);
+    var amzQty    = _autoToNum_(amzRaw);
+    var threshold = _autoToNum_(row[AUTO_COL_THRESHOLD - 1]);
+    var checkRes  = String(row[AUTO_COL_RESULT - 1] == null ? '' : row[AUTO_COL_RESULT - 1]).trim();
+    var lastCheck = row[AUTO_COL_LASTCHECK - 1];
+
+    // 取得済の認識（SP-API版／FBA貼付版の両方を許容）
+    if (checkRes === 'SP-API取得済' || checkRes === 'FBA貼付取得済') {
+      v.counts.got++;
+    } else if (checkRes === 'SP-API取得済（単体補完）') {
+      v.counts.got++; v.counts.single++;
+    }
+
+    // ===== システム異常系 =====
+    if (checkRes === 'SP-API未発見' || checkRes === 'FBA貼付未発見') {
+      v.counts.missing++;
+      _autoPush_(v.sysIssues, sku + ' / 在庫未発見 / eBay在庫=' + ebayQty);
+    }
+    if (checkRes === '') {
+      v.counts.resultBlank++;
+      _autoPush_(v.sysIssues, sku + ' / 確認結果が空欄');
+    }
+    if (lastCheck === '' || lastCheck === null) {
+      v.counts.lastCheckBlank++;
+      _autoPush_(v.sysIssues, sku + ' / 最終確認日時が空欄');
+    }
+    if (amzBlank) {
+      v.counts.amzBlank++;
+      _autoPush_(v.sysIssues, sku + ' / Amazon在庫が空欄');
+    }
+
+    // ===== 在庫アラート系（Amazon在庫が数値の場合のみ）=====
+    if (!amzBlank && !isNaN(amzQty)) {
+      if (amzQty === 0) {
+        v.counts.amzZero++;
+        _autoPush_(v.stockIssues, sku + ' / Amazon在庫0 / eBay在庫=' + ebayQty);
+      } else if (threshold >= 1 && amzQty <= threshold) {
+        v.counts.lowStock++;
+        _autoPush_(v.stockIssues, sku + ' / 在庫少 Amazon=' + amzQty + ' / 基準=' + threshold);
+      }
+      if (ebayQty > amzQty) {
+        v.counts.ebayOver++;
+        _autoPush_(v.stockIssues, sku + ' / eBay在庫超過 eBay=' + ebayQty + ' > Amazon=' + amzQty);
+      }
+    }
+  }
+
+  var c = v.counts;
+  v.sysAbnormal   = (c.missing > 0 || c.amzBlank > 0 || c.resultBlank > 0 || c.lastCheckBlank > 0);
+  v.hasStockAlert = (c.amzZero > 0 || c.lowStock > 0 || c.ebayOver > 0);
+
+  return v;
+}
+
+
+/**
+ * 【3】毎日17:10頃JSTのトリガー作成（既存同名トリガーは削除してから）
+ * ※トリガー作成は利用者が手動実行する想定。自動では呼ばない。
+ */
+function setupInventorySyncAutoTrigger() {
+  var triggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === 'runInventorySyncAllAuto') {
+      ScriptApp.deleteTrigger(triggers[i]);
+    }
+  }
+
+  ScriptApp.newTrigger('runInventorySyncAllAuto')
+    .timeBased()
+    .everyDays(1)
+    .atHour(17)
+    .nearMinute(10)
+    .inTimezone('Asia/Tokyo')
+    .create();
+
+  sendLine('✅ 在庫同期 自動トリガー設定完了\n'
+    + '毎日17:10頃に自動実行します。\n\n'
+    + '今後、人間がスプレッドシートを開いて確認する必要はありません。');
+
+  Logger.log('トリガー設定完了: runInventorySyncAllAuto 毎日17:10頃 JST');
+}
+
+
+/**
+ * 【4】旧方式トリガーの残存確認（削除はしない・警告のみ）
+ */
+function listInventoryRelatedTriggers() {
+  var triggers = ScriptApp.getProjectTriggers();
+  var all = [];
+  var legacyFound = [];
+
+  for (var i = 0; i < triggers.length; i++) {
+    var fn = triggers[i].getHandlerFunction();
+    all.push(fn);
+    if (AUTO_LEGACY_TRIGGER_FUNCS.indexOf(fn) !== -1) {
+      legacyFound.push(fn);
+    }
+  }
+
+  Logger.log('現在のトリガー一覧: ' + (all.length ? all.join(', ') : '（なし）'));
+
+  if (legacyFound.length > 0) {
+    var msg = '⚠️ 旧方式トリガー残存警告\n\n'
+      + '以下の旧トリガーが残っています。\n'
+      + '意図せずeBay在庫が変更される恐れがあります。\n\n'
+      + legacyFound.join('\n') + '\n\n'
+      + 'GASエディタ「トリガー」画面から手動で削除してください。\n'
+      + '（このスクリプトは自動削除しません）';
+    try { sendLine(msg); } catch (e) { Logger.log('LINE送信失敗: ' + e); }
+    Logger.log('旧トリガー検出: ' + legacyFound.join(', '));
+  } else {
+    Logger.log('旧方式トリガーは見つかりませんでした（クリーン）');
+  }
+
+  return { all: all, legacy: legacyFound };
+}
+
+
+// ===== LINE文面（このファイル専用・_auto 接頭辞）=====
+
+function _autoBuildOkMessage_(v) {
+  var c = v.counts;
+  return '✅ 在庫同期 自動確認OK\n'
+    + 'システム状態: 正常\n\n'
+    + '対象SKU: ' + c.target + '件\n'
+    + '在庫取得済: ' + c.got + '件（単体補完 ' + c.single + '件）\n'
+    + '在庫アラート: なし\n\n'
+    + '時刻: ' + _autoNowStr_();
+}
+
+function _autoBuildStockAlertMessage_(v) {
+  var c = v.counts;
+  return '📦 在庫アラートあり\n'
+    + 'システム状態: 正常\n\n'
+    + 'Amazon在庫0: ' + c.amzZero + '件\n'
+    + '在庫少: ' + c.lowStock + '件\n'
+    + 'eBay在庫超過: ' + c.ebayOver + '件\n\n'
+    + '【対象SKU 上位10件】\n'
+    + _autoTopList_(v.stockIssues, 10) + '\n\n'
+    + '時刻: ' + _autoNowStr_();
+}
+
+function _autoBuildSystemErrorMessage_(v) {
+  if (v.fatal) {
+    return '❌ 在庫同期 システム異常\n\n【異常内容】\n' + v.fatal + '\n\n時刻: ' + _autoNowStr_();
+  }
+  var c = v.counts;
+  var lines = [];
+  if (c.missing > 0)        lines.push('在庫未発見: ' + c.missing + '件');
+  if (c.amzBlank > 0)       lines.push('Amazon在庫空欄: ' + c.amzBlank + '件');
+  if (c.resultBlank > 0)    lines.push('確認結果空欄: ' + c.resultBlank + '件');
+  if (c.lastCheckBlank > 0) lines.push('最終確認日時空欄: ' + c.lastCheckBlank + '件');
+
+  return '❌ 在庫同期 システム異常\n\n'
+    + '【異常内容】\n'
+    + lines.join('\n') + '\n\n'
+    + '【対象SKU 上位10件】\n'
+    + _autoTopList_(v.sysIssues, 10) + '\n\n'
+    + '時刻: ' + _autoNowStr_();
+}
+
+function _autoTopList_(arr, n) { return arr.slice(0, n).join('\n'); }
+function _autoPush_(arr, line) { if (arr.indexOf(line) === -1) arr.push(line); }
+
+/** SAMPLE / TEST / DUMMY 等のテストSKUか判定（部分一致・大文字小文字無視） */
+function _autoIsTestSku_(sku) {
+  var u = String(sku == null ? '' : sku).toUpperCase();
+  for (var i = 0; i < AUTO_TEST_SKU_TOKENS.length; i++) {
+    if (u.indexOf(AUTO_TEST_SKU_TOKENS[i]) !== -1) return true;
+  }
+  return false;
+}
+
+function _autoToNum_(v) {
+  if (v === '' || v === null || v === undefined) return NaN;
+  var n = Number(v);
+  return isNaN(n) ? NaN : n;
+}
+
+function _autoNowStr_() {
+  return Utilities.formatDate(new Date(), 'Asia/Tokyo', 'MM/dd HH:mm');
+}
+
+/** SKU正規化（normalizeSku_があれば使用、無ければtrimのみ）*/
+function _normSku_(sku) {
+  if (typeof normalizeSku_ === 'function') {
+    try { return normalizeSku_(sku); } catch (e) {}
+  }
+  return String(sku == null ? '' : sku).trim();
+}
+
+function updateStockSyncDFromFbaPaste_RUN() {
+  var r = updateStockSyncDFromFbaPaste_();
+  Logger.log('結果: ' + JSON.stringify(r));
+}
+
+function sampleCsvProps_() {
+  return PropertiesService.getScriptProperties();
 }

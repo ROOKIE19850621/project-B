@@ -1,0 +1,267 @@
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('発送管理')
+    .addItem('管理番号を発送済荷物B列へ追加', 'copyShipmentNumbersToDoneSheetColumnB')
+    .addToUi();
+}
+
+/**
+ * 指定した管理番号を発送済荷物B列へ追加し、
+ * 同じL列の貨物内に食品があればメール下書きを作成する。
+ */
+function copyShipmentNumbersToDoneSheetColumnB() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ui = SpreadsheetApp.getUi();
+  const sourceSheet = ss.getSheetByName('発送予定_荷姿確定');
+
+  if (!sourceSheet) {
+    throw new Error('発送予定_荷姿確定 シートが見つかりません。');
+  }
+
+  let destSheet = ss.getSheetByName('発送済荷物');
+  if (!destSheet) destSheet = ss.insertSheet('発送済荷物');
+
+  const response = ui.prompt(
+    '発送済荷物へ追加',
+    '追加する管理番号を入力してください。\n複数の場合はスペース区切りです。',
+    ui.ButtonSet.OK_CANCEL
+  );
+
+  if (response.getSelectedButton() !== ui.Button.OK) return;
+
+  const targetNumbers = [...new Set(
+    response.getResponseText().trim().split(/\s+/).filter(Boolean)
+  )];
+
+  if (targetNumbers.length === 0) {
+    ui.alert('管理番号が入力されていません。');
+    return;
+  }
+
+  const lastRow = sourceSheet.getLastRow();
+  if (lastRow < 2) {
+    ui.alert('発送予定_荷姿確定 シートにデータがありません。');
+    return;
+  }
+
+  const sourceData = sourceSheet
+    .getRange(2, 1, lastRow - 1, 15)
+    .getDisplayValues();
+
+  const rowsByNumber = new Map();
+  sourceData.forEach(row => {
+    const number = String(row[0] || '').trim();
+    if (number && !rowsByNumber.has(number)) rowsByNumber.set(number, row);
+  });
+
+  const notFound = targetNumbers.filter(number => !rowsByNumber.has(number));
+  if (notFound.length > 0) {
+    ui.alert(
+      '発送予定_荷姿確定 のA列に見つからない管理番号があります。\n\n' +
+      notFound.join(' ') + '\n\n処理を中止しました。'
+    );
+    return;
+  }
+
+  const confirm = ui.alert(
+    '追加確認',
+    '以下を発送済荷物B列へ追加します。\n\n' + targetNumbers.join('\n'),
+    ui.ButtonSet.YES_NO
+  );
+  if (confirm !== ui.Button.YES) return;
+
+  const startRow = getLastNonEmptyRowInColumn_(destSheet, 2) + 1;
+  destSheet
+    .getRange(startRow, 2, targetNumbers.length, 1)
+    .setValues(targetNumbers.map(number => [number]));
+
+  const foodTargetNumbers = targetNumbers.filter(number => {
+    return getFoodBoxInfo_(rowsByNumber.get(number), sourceData).matched;
+  });
+
+  let draftMessage = '\n\n同じ貨物内に食品がないため、下書き対象外です。';
+  if (foodTargetNumbers.length > 0) {
+    try {
+      // 取得済みデータを渡し、発送予定_荷姿確定の再読み込みを避ける。
+      createFoodShipmentDraft_(foodTargetNumbers, sourceData);
+      draftMessage = '\n\n食品を含むため、メール下書きを作成しました。';
+    } catch (error) {
+      draftMessage = '\n\nメール下書きを作成できませんでした。\nエラー: ' + error.message;
+    }
+  }
+
+  ui.alert(
+    '追加完了しました。\n\n追加件数: ' + targetNumbers.length + '件\n\n' +
+    targetNumbers.join(' ') + draftMessage
+  );
+}
+
+/** L列が同じ行を同じ貨物として、O列に「食品」があるか判定する。 */
+function getFoodBoxInfo_(representativeRow, allRows) {
+  const groupValue = String(representativeRow[11] || '').trim();
+  const boxRows = groupValue
+    ? allRows.filter(row => String(row[11] || '').trim() === groupValue)
+    : [representativeRow];
+
+  const foodRows = boxRows.filter(row => {
+    return String(row[14] || '').trim() === '食品';
+  });
+
+  return {
+    matched: foodRows.length > 0,
+    groupValue: groupValue,
+    boxRows: boxRows,
+    foodNumbers: foodRows
+      .map(row => String(row[0] || '').trim())
+      .filter(Boolean)
+  };
+}
+
+/**
+ * 発送予定のA列から代表管理番号を特定し、AQ列・AS列を本文へ入れる。
+ * 件名は発送予定_荷姿確定の代表管理番号行にあるL列の値。
+ */
+function createFoodShipmentDraft_(shipmentNumbers, sourceData) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const shapeSheet = ss.getSheetByName('発送予定_荷姿確定');
+  const trackingSpreadsheet = SpreadsheetApp.openById(
+    '1_PqYPsK8GxSuFJ_Fq_FheExl8-xjHoq2JnpKIZ9zTus'
+  );
+  const shippingSheet = trackingSpreadsheet.getSheetByName('進捗管理');
+
+  if (!shapeSheet) throw new Error('発送予定_荷姿確定 シートが見つかりません。');
+  if (!shippingSheet) throw new Error('進捗管理 シートが見つかりません。');
+
+  const targetSet = new Set(shipmentNumbers.map(number => String(number).trim()));
+  // 通常処理では呼び出し元の取得済みデータを再利用する。
+  // 単独実行時だけシートを読み込む。
+  const shapeData = sourceData || shapeSheet
+    .getRange(2, 1, shapeSheet.getLastRow() - 1, 15)
+    .getDisplayValues();
+
+  // 発送予定_荷姿確定で、A列が入力番号に一致しN列が空白でない行を代表行とする。
+  const representativeShapeRow = shapeData.find(row => {
+    const numberA = String(row[0] || '').trim();
+    const valueN = String(row[13] || '').trim();
+    return targetSet.has(numberA) && valueN !== '';
+  });
+
+  if (!representativeShapeRow) {
+    throw new Error('発送予定_荷姿確定に、A列一致・N列非空白の代表行がありません。');
+  }
+
+  const representativeNumber = String(representativeShapeRow[0] || '').trim();
+  const subject = String(representativeShapeRow[11] || '').trim(); // L列
+  if (!subject) throw new Error('代表管理番号行のL列が空白です。');
+
+  const shippingLastRow = shippingSheet.getLastRow();
+  if (shippingLastRow < 2) throw new Error('進捗管理 シートにデータがありません。');
+
+  // 全45列を読み込まず、A列で代表管理番号の行だけを直接検索する。
+  const matchingCells = shippingSheet
+    .getRange(2, 1, shippingLastRow - 1, 1)
+    .createTextFinder(representativeNumber)
+    .matchEntireCell(true)
+    .findAll();
+
+  if (matchingCells.length === 0) {
+    throw new Error('進捗管理のA列に代表管理番号がありません: ' + representativeNumber);
+  }
+
+  let trackingNumber = '';
+  let entryNumber = '';
+  for (const cell of matchingCells) {
+    const values = shippingSheet
+      .getRange(cell.getRow(), 43, 1, 3)
+      .getDisplayValues()[0];
+    if (!trackingNumber) trackingNumber = String(values[0] || '').trim();
+    if (!entryNumber) entryNumber = String(values[2] || '').trim();
+    if (trackingNumber && entryNumber) break;
+  }
+
+  const body = [
+    '追跡番号：' + (trackingNumber || '未設定'),
+    'エントリー番号：' + (entryNumber || '未設定'),
+    '',
+    'paperwork@fedex.com',
+    'をあて先に入れる',
+    '',
+    'G:\\マイドライブ\\SKYCREW_Japan\\S_送り状',
+    'から追跡番号に該当するファイルを添付してください'
+  ].join('\n');
+
+  GmailApp.createDraft('shinicchee@gmail.com', subject, body);
+}
+
+/** B列へ追記せず、食品判定だけを確認する。 */
+function debugFoodDraftConditions() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ui = SpreadsheetApp.getUi();
+  const sheet = ss.getSheetByName('発送予定_荷姿確定');
+  if (!sheet) throw new Error('発送予定_荷姿確定 シートが見つかりません。');
+
+  const response = ui.prompt(
+    '食品判定デバッグ',
+    '管理番号を入力してください。複数の場合はスペース区切りです。',
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (response.getSelectedButton() !== ui.Button.OK) return;
+
+  const numbers = [...new Set(
+    response.getResponseText().trim().split(/\s+/).filter(Boolean)
+  )];
+  if (numbers.length === 0) return;
+
+  const data = sheet
+    .getRange(2, 1, sheet.getLastRow() - 1, 15)
+    .getDisplayValues();
+  const rowsByNumber = new Map();
+  data.forEach(row => {
+    const number = String(row[0] || '').trim();
+    if (number && !rowsByNumber.has(number)) rowsByNumber.set(number, row);
+  });
+
+  const results = numbers.map(number => {
+    const row = rowsByNumber.get(number);
+    if (!row) return number + ': A列に見つかりません';
+    const info = getFoodBoxInfo_(row, data);
+    return number +
+      ': L列=[' + info.groupValue + ']' +
+      ', 同貨物行数=' + info.boxRows.length +
+      ', 食品管理番号=[' + info.foodNumbers.join(' ') + ']' +
+      ', 対象=' + (info.matched ? 'はい' : 'いいえ');
+  });
+
+  results.forEach(result => console.log(result));
+  ui.alert('食品判定結果', results.join('\n'), ui.ButtonSet.OK);
+}
+
+/** B列へ追記せず、実在する管理番号でメール下書きだけをテストする。 */
+function debugCreateGmailDraft() {
+  const ui = SpreadsheetApp.getUi();
+  const response = ui.prompt(
+    'Gmail下書きテスト',
+    '管理番号を入力してください。複数の場合はスペース区切りです。',
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (response.getSelectedButton() !== ui.Button.OK) return;
+
+  const numbers = response.getResponseText().trim().split(/\s+/).filter(Boolean);
+  if (numbers.length === 0) return;
+
+  try {
+    createFoodShipmentDraft_(numbers);
+    ui.alert('Gmail下書きテスト成功');
+  } catch (error) {
+    console.error(error.stack || error);
+    ui.alert('Gmail下書きテスト失敗\n\n' + error.message);
+  }
+}
+
+/** 指定列の最終入力行を取得する。 */
+function getLastNonEmptyRowInColumn_(sheet, columnNumber) {
+  const bottomCell = sheet.getRange(sheet.getMaxRows(), columnNumber);
+  const lastCell = bottomCell.getNextDataCell(SpreadsheetApp.Direction.UP);
+  const value = String(lastCell.getDisplayValue() || '').trim();
+  return value === '' ? 0 : lastCell.getRow();
+}
