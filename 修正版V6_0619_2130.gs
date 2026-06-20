@@ -12517,5 +12517,41 @@ function setupDailyInventoryApprovalTrigger() {
   Logger.log('日次トリガー設定完了: dailyInventoryApprovalNotify 毎日8時頃');
 }
 
-//テスト前
-//テスト後
+function handleInventoryApproval_(decision, replyToken) {
+  var INV_SS_ID = '1exGBAEx99-2Qc9d0DLRiZbygvgIo4FY_NoBG3Nkan-A';
+  var SHEET_NAME = 'eBay在庫承認';
+  var STATUS_COL = 8;
+
+  var ss = SpreadsheetApp.openById(INV_SS_ID);
+  var sheet = ss.getSheetByName(SHEET_NAME);
+  if (!sheet) {
+    if (decision === '停める') replyToLine(replyToken, '在庫承認シートが見つかりません。');
+    return;
+  }
+
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) {
+    if (decision === '停める') replyToLine(replyToken, '承認待ちの候補はありません。');
+    return;
+  }
+
+  var range = sheet.getRange(2, STATUS_COL, lastRow - 1, 1);
+  var statuses = range.getValues();
+  var newStatus = (decision === '進める') ? '承認済' : '破棄';
+  var count = 0;
+
+  for (var i = 0; i < statuses.length; i++) {
+    if (String(statuses[i][0] == null ? '' : statuses[i][0]).trim() === '承認待ち') {
+      statuses[i][0] = newStatus;
+      count++;
+    }
+  }
+  range.setValues(statuses);
+
+  if (decision === '進める') {
+    Logger.log('在庫承認: 承認済に変更 ' + count + '件（返事なし）');
+  } else {
+    replyToLine(replyToken, '在庫変更を破棄しました（' + count + '件）。');
+    Logger.log('在庫承認: 破棄に変更 ' + count + '件');
+  }
+}
