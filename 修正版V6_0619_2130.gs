@@ -12443,3 +12443,76 @@ function _apvGetEbayToken_() {
   }
   return '';
 }
+
+/* ===================================================================
+ * Q3 Stage3：1日1回 LINE通知（候補件数）  ※eBay書き込みなし
+ * -------------------------------------------------------------------
+ * 1日1回、候補を検出して「eBay在庫承認」シートを更新し、
+ * 承認待ちが1件以上あれば LINE を1通だけ送る。
+ *
+ * 実行：dailyInventoryApprovalNotify（手動テスト可）
+ * トリガー設定：setupDailyInventoryApprovalTrigger を1回実行（毎日8時頃）
+ *
+ * 既存を流用：detectInventoryApprovalCandidates_RUN（Stage1）/ sendLine
+ * =================================================================== */
+
+function dailyInventoryApprovalNotify() {
+  // 1) 候補を検出して「eBay在庫承認」シートを更新（eBayには触れない）
+  detectInventoryApprovalCandidates_RUN();
+
+  // 2) シートから「承認待ち」を方向別に集計
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(APPROVAL_SHEET_NAME);
+  if (!sheet) { Logger.log('NG: シートなし ' + APPROVAL_SHEET_NAME); return; }
+
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) { Logger.log('候補なし → LINE送信せず'); return; }
+
+  var data = sheet.getRange(2, 1, lastRow - 1, 8).getValues();
+  var to1 = 0, to0 = 0;
+  for (var i = 0; i < data.length; i++) {
+    var status = String(data[i][7] == null ? '' : data[i][7]).trim(); // H 状態
+    if (status !== '承認待ち') continue;
+    var dir = String(data[i][3] == null ? '' : data[i][3]).trim();     // D 方向
+    if (dir === '0→1') to1++;
+    else if (dir === '1→0') to0++;
+  }
+
+  // 3) 承認待ちが無ければ送らない（LINE節約）
+  if (to1 === 0 && to0 === 0) {
+    Logger.log('承認待ち候補なし → LINE送信せず');
+    return;
+  }
+
+  // 4) LINEを1通だけ送る
+  var msg =
+    '📦 eBay在庫 承認待ち\n' +
+    '0→1（出品再開）: ' + to1 + '件\n' +
+    '1→0（在庫切れ）: ' + to0 + '件\n\n' +
+    '「進めてください」で実行\n' +
+    '「停めてください」で破棄\n\n' +
+    '（詳細は「' + APPROVAL_SHEET_NAME + '」シート）';
+
+  sendLine(msg);
+  Logger.log('LINE通知送信: 0→1=' + to1 + ' / 1→0=' + to0);
+}
+
+
+/** 毎日8時頃に dailyInventoryApprovalNotify を動かすトリガーを作る（1回だけ実行）*/
+function setupDailyInventoryApprovalTrigger() {
+  var triggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === 'dailyInventoryApprovalNotify') {
+      ScriptApp.deleteTrigger(triggers[i]);
+    }
+  }
+  ScriptApp.newTrigger('dailyInventoryApprovalNotify')
+    .timeBased()
+    .everyDays(1)
+    .atHour(8)
+    .nearMinute(0)
+    .inTimezone('Asia/Tokyo')
+    .create();
+
+  Logger.log('日次トリガー設定完了: dailyInventoryApprovalNotify 毎日8時頃');
+}
