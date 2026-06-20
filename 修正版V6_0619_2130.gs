@@ -12517,3 +12517,4 @@ function setupDailyInventoryApprovalTrigger() {
   Logger.log('日次トリガー設定完了: dailyInventoryApprovalNotify 毎日8時頃');
 }
 
+//テスト前
