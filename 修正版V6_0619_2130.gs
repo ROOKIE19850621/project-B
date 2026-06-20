@@ -5410,12 +5410,16 @@ if (v.sysAbnormal) {
         )
       );
 
-    } else if (v.hasStockAlert) {
+    
+} else if (v.hasStockAlert) {
       sendLine(
         _autoBuildStockAlertMessage_(v)
       );
 
     } else {
+
+_autoClearNotify_('STOCK');
+
       // ✅ 変更：LINE通知を止め、ログ出力のみにする
       Logger.log(
         'ℹ️ 在庫同期はすべて正常（変更・アラートなし）のため、LINE通知をスキップしました。'
@@ -12061,4 +12065,19 @@ function _autoNormSku_(sku) {
 function applyFbaPasteToDColumn_RUN() {
   var r = updateStockSyncDFromFbaPaste_();
   Logger.log('result: ' + JSON.stringify(r));
+}
+
+function _autoNotifyOnce_(key, signatureText, message) {
+  var props = PropertiesService.getScriptProperties();
+  var k = 'LAST_NOTIFY_' + key;
+  var sig = Utilities.base64Encode(
+    Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, signatureText || '')
+  );
+  if (props.getProperty(k) === sig) { Logger.log('同一内容→通知スキップ:' + key); return false; }
+  sendLine(message);
+  props.setProperty(k, sig);
+  return true;
+}
+function _autoClearNotify_(key) {
+  PropertiesService.getScriptProperties().deleteProperty('LAST_NOTIFY_' + key);
 }
