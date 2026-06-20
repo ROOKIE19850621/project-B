@@ -12081,3 +12081,173 @@ function _autoNotifyOnce_(key, signatureText, message) {
 function _autoClearNotify_(key) {
   PropertiesService.getScriptProperties().deleteProperty('LAST_NOTIFY_' + key);
 }
+
+/* ===================================================================
+ * Q3 Stage1：在庫承認 候補検出（eBay書き込みなし・安全）
+ * -------------------------------------------------------------------
+ * ・在庫同期管理から候補を検出し、「eBay在庫承認」シートに書き出すだけ。
+ * ・eBayには一切触りません（検出のみ）。
+ * ・実行は detectInventoryApprovalCandidates_RUN を選んで実行。
+ *
+ * 候補条件（あとで調整可）：
+ *   0→1（出品再開）：eBay在庫=0 かつ Amazon在庫 >= 基準数（基準が空なら Amazon>=1）
+ *   1→0（在庫切れ）：eBay在庫>=1 かつ 基準数>=1 かつ Amazon在庫 < 基準数
+ *
+ * 使う列（在庫同期管理）：A=SKU, D=Amazon在庫, E=eBay設定在庫, F=通知基準数
+ * ItemID は eBayRaw から SKU で引く（ヘッダー自動判別）。
+ * =================================================================== */
+
+var APPROVAL_SHEET_NAME   = 'eBay在庫承認';
+var APPROVAL_SRC_STOCK    = '在庫同期管理';
+var APPROVAL_SRC_EBAYRAW  = 'eBayRaw';
+
+// 在庫同期管理の列（1始まり）
+var APV_COL_SKU       = 1; // A
+var APV_COL_AMZ       = 4; // D Amazon在庫
+var APV_COL_EBAY      = 5; // E eBay設定在庫
+var APV_COL_THRESHOLD = 6; // F 通知基準数
+
+// 除外
+var APV_SKU_EXCLUDE = ['SKU', 'WAREHOUSES', 'DELETED', 'ITEMID', 'TITLE', 'AVAILABLEQUANTITY'];
+var APV_TEST_TOKENS = ['SAMPLE', 'TEST', 'DUMMY'];
+
+// eBayRaw のヘッダー候補（小文字照合）
+var APV_RAW_HEADER_SKU    = ['sku', 'customlabel', 'custom label'];
+var APV_RAW_HEADER_ITEMID = ['itemid', 'item id', 'item number'];
+
+
+/**
+ * 候補を検出して「eBay在庫承認」シートに書き出す（eBay書き込みなし）
+ */
+function detectInventoryApprovalCandidates_RUN() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  // ItemIDマップ（eBayRaw から SKU->ItemID）
+  var itemIdMap = _apvBuildItemIdMap_(ss);
+
+  // 在庫同期管理 読み込み
+  var stock = ss.getSheetByName(APPROVAL_SRC_STOCK);
+  if (!stock) { Logger.log('NG: シートなし ' + APPROVAL_SRC_STOCK); return; }
+  var lastRow = stock.getLastRow();
+  if (lastRow < 2) { Logger.log('在庫同期管理にデータなし'); return; }
+
+  var numRows = lastRow - 1;
+  var data = stock.getRange(2, 1, numRows, 6).getValues();
+
+  var now = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm');
+  var candidates = [];
+  var to1 = 0, to0 = 0, noItemId = 0;
+
+  for (var i = 0; i < data.length; i++) {
+    var row = data[i];
+    var sku = String(row[APV_COL_SKU - 1] == null ? '' : row[APV_COL_SKU - 1]).trim();
+    if (!sku) continue;
+    if (APV_SKU_EXCLUDE.indexOf(sku.toUpperCase()) !== -1) continue;
+    if (_apvIsTestSku_(sku)) continue;
+
+    var amz = _apvNum_(row[APV_COL_AMZ - 1]);
+    var ebay = _apvNum_(row[APV_COL_EBAY - 1]);
+    var th = _apvNum_(row[APV_COL_THRESHOLD - 1]);
+    if (isNaN(amz) || isNaN(ebay)) continue;
+
+    var direction = '', target = null;
+
+    // 0->1: eBay=0 かつ Amazon在庫が基準以上
+    if (ebay === 0) {
+      var ok01 = (!isNaN(th) && th >= 1) ? (amz >= th) : (amz >= 1);
+      if (ok01) { direction = '0→1'; target = 1; }
+    }
+    // 1->0: eBay>=1 かつ 基準>=1 かつ Amazon<基準
+    if (!direction && ebay >= 1 && !isNaN(th) && th >= 1 && amz < th) {
+      direction = '1→0'; target = 0;
+    }
+
+    if (!direction) continue;
+
+    var nsku = _apvNorm_(sku);
+    var itemId = itemIdMap.hasOwnProperty(nsku) ? itemIdMap[nsku] : '';
+    if (!itemId) noItemId++;
+    if (direction === '0→1') to1++; else to0++;
+
+    candidates.push([
+      now, sku, itemId, direction, amz, ebay, target,
+      '承認待ち', '', '', (itemId ? '' : 'ItemID未取得')
+    ]);
+  }
+
+  // 承認シートへ書き出し（ヘッダー＋本体を作り直す）
+  var sheet = ss.getSheetByName(APPROVAL_SHEET_NAME);
+  if (!sheet) sheet = ss.insertSheet(APPROVAL_SHEET_NAME);
+  sheet.clearContents();
+
+  var header = ['検出日時','SKU','ItemID','方向','Amazon在庫','eBay現在','予定値','状態','実行日時','結果','エラー'];
+  sheet.getRange(1, 1, 1, header.length).setValues([header]);
+
+  if (candidates.length > 0) {
+    sheet.getRange(2, 1, candidates.length, header.length).setValues(candidates);
+  }
+
+  Logger.log('=== 在庫承認 候補検出（eBay書き込みなし）===');
+  Logger.log('0→1（出品再開）: ' + to1 + '件');
+  Logger.log('1→0（在庫切れ）: ' + to0 + '件');
+  Logger.log('ItemID未取得: ' + noItemId + '件');
+  Logger.log('「' + APPROVAL_SHEET_NAME + '」シートに ' + candidates.length + '件 書き出しました。');
+}
+
+
+/** eBayRaw から SKU->ItemID のマップを作る（ヘッダー自動判別） */
+function _apvBuildItemIdMap_(ss) {
+  var map = {};
+  var raw = ss.getSheetByName(APPROVAL_SRC_EBAYRAW);
+  if (!raw) { Logger.log('注意: eBayRawなし。ItemIDは空。'); return map; }
+
+  var values = raw.getDataRange().getValues();
+  if (!values || values.length < 2) return map;
+
+  var hdr = values[0].map(function (x) { return String(x == null ? '' : x).trim().toLowerCase(); });
+  var skuCol = _apvFindCol_(hdr, APV_RAW_HEADER_SKU);
+  var idCol = _apvFindCol_(hdr, APV_RAW_HEADER_ITEMID);
+
+  if (skuCol === -1 || idCol === -1) {
+    Logger.log('注意: eBayRawのSKU/ItemID列が不明 (sku=' + skuCol + ', id=' + idCol + ')。ItemIDは空。');
+    return map;
+  }
+
+  for (var i = 1; i < values.length; i++) {
+    var nsku = _apvNorm_(values[i][skuCol]);
+    if (!nsku) continue;
+    var id = String(values[i][idCol] == null ? '' : values[i][idCol]).trim();
+    if (id && !map.hasOwnProperty(nsku)) map[nsku] = id;
+  }
+  return map;
+}
+
+function _apvFindCol_(hdrLower, candidates) {
+  for (var c = 0; c < candidates.length; c++) {
+    var idx = hdrLower.indexOf(candidates[c]);
+    if (idx !== -1) return idx;
+  }
+  return -1;
+}
+
+function _apvNorm_(sku) {
+  if (typeof normalizeSku_ === 'function') {
+    try { return normalizeSku_(sku); } catch (e) {}
+  }
+  return String(sku == null ? '' : sku).trim();
+}
+
+function _apvIsTestSku_(sku) {
+  var u = String(sku == null ? '' : sku).toUpperCase();
+  for (var i = 0; i < APV_TEST_TOKENS.length; i++) {
+    if (u.indexOf(APV_TEST_TOKENS[i]) !== -1) return true;
+  }
+  return false;
+}
+
+function _apvNum_(v) {
+  if (v === '' || v === null || v === undefined) return NaN;
+  var n = Number(v);
+  return isNaN(n) ? NaN : n;
+}
+
