@@ -5410,12 +5410,16 @@ if (v.sysAbnormal) {
         )
       );
 
-    } else if (v.hasStockAlert) {
+    
+} else if (v.hasStockAlert) {
       sendLine(
         _autoBuildStockAlertMessage_(v)
       );
 
     } else {
+
+_autoClearNotify_('STOCK');
+
       // ✅ 変更：LINE通知を止め、ログ出力のみにする
       Logger.log(
         'ℹ️ 在庫同期はすべて正常（変更・アラートなし）のため、LINE通知をスキップしました。'
@@ -12062,3 +12066,454 @@ function applyFbaPasteToDColumn_RUN() {
   var r = updateStockSyncDFromFbaPaste_();
   Logger.log('result: ' + JSON.stringify(r));
 }
+
+function _autoNotifyOnce_(key, signatureText, message) {
+  var props = PropertiesService.getScriptProperties();
+  var k = 'LAST_NOTIFY_' + key;
+  var sig = Utilities.base64Encode(
+    Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, signatureText || '')
+  );
+  if (props.getProperty(k) === sig) { Logger.log('同一内容→通知スキップ:' + key); return false; }
+  sendLine(message);
+  props.setProperty(k, sig);
+  return true;
+}
+function _autoClearNotify_(key) {
+  PropertiesService.getScriptProperties().deleteProperty('LAST_NOTIFY_' + key);
+}
+
+/* ===================================================================
+ * Q3 Stage1：在庫承認 候補検出（eBay書き込みなし・安全）
+ * -------------------------------------------------------------------
+ * ・在庫同期管理から候補を検出し、「eBay在庫承認」シートに書き出すだけ。
+ * ・eBayには一切触りません（検出のみ）。
+ * ・実行は detectInventoryApprovalCandidates_RUN を選んで実行。
+ *
+ * 候補条件（あとで調整可）：
+ *   0→1（出品再開）：eBay在庫=0 かつ Amazon在庫 >= 基準数（基準が空なら Amazon>=1）
+ *   1→0（在庫切れ）：eBay在庫>=1 かつ 基準数>=1 かつ Amazon在庫 < 基準数
+ *
+ * 使う列（在庫同期管理）：A=SKU, D=Amazon在庫, E=eBay設定在庫, F=通知基準数
+ * ItemID は eBayRaw から SKU で引く（ヘッダー自動判別）。
+ * =================================================================== */
+
+var APPROVAL_SHEET_NAME   = 'eBay在庫承認';
+var APPROVAL_SRC_STOCK    = '在庫同期管理';
+var APPROVAL_SRC_EBAYRAW  = 'eBayRaw';
+
+// 在庫同期管理の列（1始まり）
+var APV_COL_SKU       = 1; // A
+var APV_COL_AMZ       = 4; // D Amazon在庫
+var APV_COL_EBAY      = 5; // E eBay設定在庫
+var APV_COL_THRESHOLD = 6; // F 通知基準数
+
+// 除外
+var APV_SKU_EXCLUDE = ['SKU', 'WAREHOUSES', 'DELETED', 'ITEMID', 'TITLE', 'AVAILABLEQUANTITY'];
+var APV_TEST_TOKENS = ['SAMPLE', 'TEST', 'DUMMY'];
+
+// eBayRaw のヘッダー候補（小文字照合）
+var APV_RAW_HEADER_SKU    = ['sku', 'customlabel', 'custom label'];
+var APV_RAW_HEADER_ITEMID = ['itemid', 'item id', 'item number'];
+
+
+/**
+ * 候補を検出して「eBay在庫承認」シートに書き出す（eBay書き込みなし）
+ */
+function detectInventoryApprovalCandidates_RUN() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  // ItemIDマップ（eBayRaw から SKU->ItemID）
+  var itemIdMap = _apvBuildItemIdMap_(ss);
+
+  // 在庫同期管理 読み込み
+  var stock = ss.getSheetByName(APPROVAL_SRC_STOCK);
+  if (!stock) { Logger.log('NG: シートなし ' + APPROVAL_SRC_STOCK); return; }
+  var lastRow = stock.getLastRow();
+  if (lastRow < 2) { Logger.log('在庫同期管理にデータなし'); return; }
+
+  var numRows = lastRow - 1;
+  var data = stock.getRange(2, 1, numRows, 6).getValues();
+
+  var now = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm');
+  var candidates = [];
+  var to1 = 0, to0 = 0, noItemId = 0;
+
+  for (var i = 0; i < data.length; i++) {
+    var row = data[i];
+    var sku = String(row[APV_COL_SKU - 1] == null ? '' : row[APV_COL_SKU - 1]).trim();
+    if (!sku) continue;
+    if (APV_SKU_EXCLUDE.indexOf(sku.toUpperCase()) !== -1) continue;
+    if (_apvIsTestSku_(sku)) continue;
+
+    var amz = _apvNum_(row[APV_COL_AMZ - 1]);
+    var ebay = _apvNum_(row[APV_COL_EBAY - 1]);
+    var th = _apvNum_(row[APV_COL_THRESHOLD - 1]);
+    if (isNaN(amz) || isNaN(ebay)) continue;
+
+    var direction = '', target = null;
+
+    // 0->1: eBay=0 かつ Amazon在庫が基準以上
+    if (ebay === 0) {
+      var ok01 = (!isNaN(th) && th >= 1) ? (amz >= th) : (amz >= 1);
+      if (ok01) { direction = '0→1'; target = 1; }
+    }
+    // 1->0: eBay>=1 かつ 基準>=1 かつ Amazon<基準
+    if (!direction && ebay >= 1 && !isNaN(th) && th >= 1 && amz < th) {
+      direction = '1→0'; target = 0;
+    }
+
+    if (!direction) continue;
+
+    var nsku = _apvNorm_(sku);
+    var itemId = itemIdMap.hasOwnProperty(nsku) ? itemIdMap[nsku] : '';
+    if (!itemId) noItemId++;
+    if (direction === '0→1') to1++; else to0++;
+
+    candidates.push([
+      now, sku, itemId, direction, amz, ebay, target,
+      '承認待ち', '', '', (itemId ? '' : 'ItemID未取得')
+    ]);
+  }
+
+  // 承認シートへ書き出し（ヘッダー＋本体を作り直す）
+  var sheet = ss.getSheetByName(APPROVAL_SHEET_NAME);
+  if (!sheet) sheet = ss.insertSheet(APPROVAL_SHEET_NAME);
+  sheet.clearContents();
+
+  var header = ['検出日時','SKU','ItemID','方向','Amazon在庫','eBay現在','予定値','状態','実行日時','結果','エラー'];
+  sheet.getRange(1, 1, 1, header.length).setValues([header]);
+
+  if (candidates.length > 0) {
+    sheet.getRange(2, 1, candidates.length, header.length).setValues(candidates);
+  }
+
+  Logger.log('=== 在庫承認 候補検出（eBay書き込みなし）===');
+  Logger.log('0→1（出品再開）: ' + to1 + '件');
+  Logger.log('1→0（在庫切れ）: ' + to0 + '件');
+  Logger.log('ItemID未取得: ' + noItemId + '件');
+  Logger.log('「' + APPROVAL_SHEET_NAME + '」シートに ' + candidates.length + '件 書き出しました。');
+}
+
+
+/** eBayRaw から SKU->ItemID のマップを作る（ヘッダー自動判別） */
+function _apvBuildItemIdMap_(ss) {
+  var map = {};
+  var raw = ss.getSheetByName(APPROVAL_SRC_EBAYRAW);
+  if (!raw) { Logger.log('注意: eBayRawなし。ItemIDは空。'); return map; }
+
+  var values = raw.getDataRange().getValues();
+  if (!values || values.length < 2) return map;
+
+  var hdr = values[0].map(function (x) { return String(x == null ? '' : x).trim().toLowerCase(); });
+  var skuCol = _apvFindCol_(hdr, APV_RAW_HEADER_SKU);
+  var idCol = _apvFindCol_(hdr, APV_RAW_HEADER_ITEMID);
+
+  if (skuCol === -1 || idCol === -1) {
+    Logger.log('注意: eBayRawのSKU/ItemID列が不明 (sku=' + skuCol + ', id=' + idCol + ')。ItemIDは空。');
+    return map;
+  }
+
+  for (var i = 1; i < values.length; i++) {
+    var nsku = _apvNorm_(values[i][skuCol]);
+    if (!nsku) continue;
+    var id = String(values[i][idCol] == null ? '' : values[i][idCol]).trim();
+    if (id && !map.hasOwnProperty(nsku)) map[nsku] = id;
+  }
+  return map;
+}
+
+function _apvFindCol_(hdrLower, candidates) {
+  for (var c = 0; c < candidates.length; c++) {
+    var idx = hdrLower.indexOf(candidates[c]);
+    if (idx !== -1) return idx;
+  }
+  return -1;
+}
+
+function _apvNorm_(sku) {
+  if (typeof normalizeSku_ === 'function') {
+    try { return normalizeSku_(sku); } catch (e) {}
+  }
+  return String(sku == null ? '' : sku).trim();
+}
+
+function _apvIsTestSku_(sku) {
+  var u = String(sku == null ? '' : sku).toUpperCase();
+  for (var i = 0; i < APV_TEST_TOKENS.length; i++) {
+    if (u.indexOf(APV_TEST_TOKENS[i]) !== -1) return true;
+  }
+  return false;
+}
+
+function _apvNum_(v) {
+  if (v === '' || v === null || v === undefined) return NaN;
+  var n = Number(v);
+  return isNaN(n) ? NaN : n;
+}
+
+/* ===================================================================
+ * Q3 Stage2：在庫承認 実行部品（eBay書き込み・安全装置付き）
+ * -------------------------------------------------------------------
+ * 「eBay在庫承認」シートの 状態='承認済' の行だけを実行する。
+ *
+ * ★安全装置（必ず確認）★
+ *   INVENTORY_EXEC_DRYRUN  = true  → プレビューのみ。eBayに一切触れない。
+ *   INVENTORY_EXEC_ENABLED = false → 本番実行しない（DRYRUN=falseでも安全側で停止）
+ *   INVENTORY_EXEC_LIMIT   = 5     → 1回の実行上限
+ *
+ *   ＝ 実際にeBayを変えるのは「DRYRUN=false かつ ENABLED=true」の時だけ。
+ *
+ * 実行：executeApprovedInventory_RUN を選んで実行
+ * 結果は「eBay在庫承認」シートの H/I/J/K に書き戻す。
+ * =================================================================== */
+
+var INVENTORY_EXEC_DRYRUN  = true;   // ★まずは true（プレビュー）
+var INVENTORY_EXEC_ENABLED = false;  // ★まずは false（本番停止）
+var INVENTORY_EXEC_LIMIT   = 5;      // 1回の上限
+
+// 承認シートの列（Stage1と同じ）
+var APV_C_DATE   = 1;  // A 検出日時
+var APV_C_SKU    = 2;  // B SKU
+var APV_C_ITEMID = 3;  // C ItemID
+var APV_C_DIR    = 4;  // D 方向
+var APV_C_AMZ    = 5;  // E Amazon在庫
+var APV_C_EBAY   = 6;  // F eBay現在
+var APV_C_TARGET = 7;  // G 予定値
+var APV_C_STATUS = 8;  // H 状態
+var APV_C_EXECAT = 9;  // I 実行日時
+var APV_C_RESULT = 10; // J 結果
+var APV_C_ERROR  = 11; // K エラー
+
+
+/**
+ * 状態='承認済' の行を実行（DRY-RUN/本番は上のフラグで切替）
+ */
+function executeApprovedInventory_RUN() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(APPROVAL_SHEET_NAME); // Stage1の定数を流用
+  if (!sheet) { Logger.log('NG: シートなし ' + APPROVAL_SHEET_NAME); return; }
+
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) { Logger.log('承認シートにデータなし'); return; }
+
+  var numRows = lastRow - 1;
+  var data = sheet.getRange(2, 1, numRows, 11).getValues();
+
+  // 対象＝状態が「承認済」かつ ItemIDあり
+  var targets = [];
+  for (var i = 0; i < data.length; i++) {
+    var status = String(data[i][APV_C_STATUS - 1] == null ? '' : data[i][APV_C_STATUS - 1]).trim();
+    var itemId = String(data[i][APV_C_ITEMID - 1] == null ? '' : data[i][APV_C_ITEMID - 1]).trim();
+    if (status === '承認済' && itemId) {
+      targets.push({ rowIndex: i + 2, data: data[i] });
+    }
+  }
+
+  if (targets.length === 0) {
+    Logger.log('実行対象（承認済）がありません。');
+    Logger.log('※テスト時は、承認シートのH列を手動で「承認済」にしてから実行してください。');
+    return;
+  }
+
+  // 件数上限
+  var willProcess = targets.slice(0, INVENTORY_EXEC_LIMIT);
+
+  Logger.log('=== 在庫承認 実行 ===');
+  Logger.log('DRY-RUN=' + INVENTORY_EXEC_DRYRUN + ' / ENABLED=' + INVENTORY_EXEC_ENABLED
+    + ' / 対象=' + targets.length + '件（上限' + INVENTORY_EXEC_LIMIT + 'で' + willProcess.length + '件処理）');
+
+  // 本番実行する条件
+  var doRealUpdate = (INVENTORY_EXEC_DRYRUN === false && INVENTORY_EXEC_ENABLED === true);
+
+  var token = '';
+  if (doRealUpdate) {
+    token = _apvGetEbayToken_();
+    if (!token) {
+      Logger.log('NG: eBayトークン取得失敗。実行中止（シートは変更しません）。');
+      return;
+    }
+  }
+
+  var now = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm');
+  var okCount = 0, ngCount = 0;
+
+  for (var t = 0; t < willProcess.length; t++) {
+    var r = willProcess[t];
+    var sku = String(r.data[APV_C_SKU - 1]).trim();
+    var itemId = String(r.data[APV_C_ITEMID - 1]).trim();
+    var dir = String(r.data[APV_C_DIR - 1]).trim();
+    var target = _apvNum_(r.data[APV_C_TARGET - 1]);
+    if (isNaN(target)) target = (dir === '0→1') ? 1 : 0;
+
+    if (!doRealUpdate) {
+      // DRY-RUN：ログのみ。シートは変えない。
+      Logger.log('[DRY-RUN] ' + sku + ' / ' + dir + ' / ItemID=' + itemId
+        + ' → eBay数量を ' + target + ' にする（予定）');
+      continue;
+    }
+
+    // 本番：eBay更新
+    var res = reviseEbayQuantity_(itemId, target, token);
+    if (res && res.success) {
+      sheet.getRange(r.rowIndex, APV_C_STATUS).setValue('実行済');
+      sheet.getRange(r.rowIndex, APV_C_EXECAT).setValue(now);
+      sheet.getRange(r.rowIndex, APV_C_RESULT).setValue('成功');
+      sheet.getRange(r.rowIndex, APV_C_ERROR).setValue('');
+      okCount++;
+      Logger.log('OK ' + sku + ' / ' + dir + ' → ' + target);
+    } else {
+      sheet.getRange(r.rowIndex, APV_C_STATUS).setValue('失敗');
+      sheet.getRange(r.rowIndex, APV_C_EXECAT).setValue(now);
+      sheet.getRange(r.rowIndex, APV_C_RESULT).setValue('失敗');
+      sheet.getRange(r.rowIndex, APV_C_ERROR).setValue(res ? String(res.message || res.ack || 'error').substring(0, 200) : 'no response');
+      ngCount++;
+      Logger.log('NG ' + sku + ' / ' + dir + ' → ' + (res ? (res.message || res.ack) : 'no response'));
+    }
+    Utilities.sleep(500); // eBay負荷軽減
+  }
+
+  if (doRealUpdate) {
+    Logger.log('実行完了：成功' + okCount + ' / 失敗' + ngCount);
+  } else {
+    Logger.log('DRY-RUN完了：上記は「予定」です。eBayは変更していません。');
+    Logger.log('本番実行するには INVENTORY_EXEC_DRYRUN=false かつ INVENTORY_EXEC_ENABLED=true に変更。');
+  }
+}
+
+
+/**
+ * eBay数量を指定値に変更（ReviseFixedPriceItem）。0でも1でも可。
+ * 既存 reviseEbayAvailableToZero_ の数量を引数化したもの。
+ */
+function reviseEbayQuantity_(itemId, qty, accessToken) {
+  var xml =
+    '<?xml version="1.0" encoding="UTF-8"?>' +
+    '<ReviseFixedPriceItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">' +
+      '<Item>' +
+        '<ItemID>' + itemId + '</ItemID>' +
+        '<Quantity>' + qty + '</Quantity>' +
+      '</Item>' +
+    '</ReviseFixedPriceItemRequest>';
+
+  try {
+    var response = UrlFetchApp.fetch('https://api.ebay.com/ws/api.dll', {
+      method: 'post',
+      headers: {
+        'X-EBAY-API-IAF-TOKEN': accessToken,
+        'X-EBAY-API-CALL-NAME': 'ReviseFixedPriceItem',
+        'X-EBAY-API-SITEID': '0',
+        'X-EBAY-API-COMPATIBILITY-LEVEL': '1199',
+        'Content-Type': 'text/xml'
+      },
+      payload: xml,
+      muteHttpExceptions: true
+    });
+
+    var httpCode = response.getResponseCode();
+    var body = response.getContentText();
+    var ack = (body.match(/<Ack>([^<]+)<\/Ack>/) || [])[1] || '';
+    var shortMessage = (body.match(/<ShortMessage>([\s\S]*?)<\/ShortMessage>/) || [])[1] || '';
+
+    Logger.log('ReviseFixedPriceItem [' + httpCode + '] ItemID=' + itemId + ' qty=' + qty + ' Ack=' + ack
+      + (shortMessage ? (' / ' + shortMessage) : ''));
+
+    return {
+      success: (httpCode === 200 && (ack === 'Success' || ack === 'Warning')),
+      httpCode: httpCode,
+      ack: ack,
+      message: shortMessage
+    };
+  } catch (err) {
+    return { success: false, httpCode: 0, ack: '', message: String(err) };
+  }
+}
+
+
+/** eBayアクセストークン取得（既存関数を優先利用） */
+function _apvGetEbayToken_() {
+  try {
+    if (typeof getEbayAccessTokenForFbaZeroAuto_ === 'function') {
+      return getEbayAccessTokenForFbaZeroAuto_();
+    }
+    if (typeof getEbayAccessTokenFromRefreshToken === 'function') {
+      return getEbayAccessTokenFromRefreshToken();
+    }
+  } catch (e) {
+    Logger.log('トークン取得エラー: ' + e);
+  }
+  return '';
+}
+
+/* ===================================================================
+ * Q3 Stage3：1日1回 LINE通知（候補件数）  ※eBay書き込みなし
+ * -------------------------------------------------------------------
+ * 1日1回、候補を検出して「eBay在庫承認」シートを更新し、
+ * 承認待ちが1件以上あれば LINE を1通だけ送る。
+ *
+ * 実行：dailyInventoryApprovalNotify（手動テスト可）
+ * トリガー設定：setupDailyInventoryApprovalTrigger を1回実行（毎日8時頃）
+ *
+ * 既存を流用：detectInventoryApprovalCandidates_RUN（Stage1）/ sendLine
+ * =================================================================== */
+
+function dailyInventoryApprovalNotify() {
+  // 1) 候補を検出して「eBay在庫承認」シートを更新（eBayには触れない）
+  detectInventoryApprovalCandidates_RUN();
+
+  // 2) シートから「承認待ち」を方向別に集計
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(APPROVAL_SHEET_NAME);
+  if (!sheet) { Logger.log('NG: シートなし ' + APPROVAL_SHEET_NAME); return; }
+
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) { Logger.log('候補なし → LINE送信せず'); return; }
+
+  var data = sheet.getRange(2, 1, lastRow - 1, 8).getValues();
+  var to1 = 0, to0 = 0;
+  for (var i = 0; i < data.length; i++) {
+    var status = String(data[i][7] == null ? '' : data[i][7]).trim(); // H 状態
+    if (status !== '承認待ち') continue;
+    var dir = String(data[i][3] == null ? '' : data[i][3]).trim();     // D 方向
+    if (dir === '0→1') to1++;
+    else if (dir === '1→0') to0++;
+  }
+
+  // 3) 承認待ちが無ければ送らない（LINE節約）
+  if (to1 === 0 && to0 === 0) {
+    Logger.log('承認待ち候補なし → LINE送信せず');
+    return;
+  }
+
+  // 4) LINEを1通だけ送る
+  var msg =
+    '📦 eBay在庫 承認待ち\n' +
+    '0→1（出品再開）: ' + to1 + '件\n' +
+    '1→0（在庫切れ）: ' + to0 + '件\n\n' +
+    '「進めてください」で実行\n' +
+    '「停めてください」で破棄\n\n' +
+    '（詳細は「' + APPROVAL_SHEET_NAME + '」シート）';
+
+  sendLine(msg);
+  Logger.log('LINE通知送信: 0→1=' + to1 + ' / 1→0=' + to0);
+}
+
+
+/** 毎日8時頃に dailyInventoryApprovalNotify を動かすトリガーを作る（1回だけ実行）*/
+function setupDailyInventoryApprovalTrigger() {
+  var triggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === 'dailyInventoryApprovalNotify') {
+      ScriptApp.deleteTrigger(triggers[i]);
+    }
+  }
+  ScriptApp.newTrigger('dailyInventoryApprovalNotify')
+    .timeBased()
+    .everyDays(1)
+    .atHour(8)
+    .nearMinute(0)
+    .inTimezone('Asia/Tokyo')
+    .create();
+
+  Logger.log('日次トリガー設定完了: dailyInventoryApprovalNotify 毎日8時頃');
+}
+
