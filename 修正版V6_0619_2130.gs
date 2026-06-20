@@ -9079,157 +9079,6 @@ function logAnomalyMonitorResult_(ss, checkedCount, notifyCount, errorCount, ano
 //       eBay受注ログを全件監視判定し、結果を書き込む
 // ============================================================
 
-function runMcfAnomalyMonitor() {
-  const NOW_JST = new Date();
-
-  Logger.log('');
-  Logger.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  Logger.log('【runMcfAnomalyMonitor v2】MCF異常監視');
-  Logger.log('  実行日時: ' + Utilities.formatDate(NOW_JST, 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss'));
-  Logger.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  Logger.log('');
-
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const eBayLog = ss.getSheetByName(ANOMALY_EBAY_LOG_SHEET_);
-  if (!eBayLog) {
-    Logger.log('❌ 「' + ANOMALY_EBAY_LOG_SHEET_ + '」シートが見つかりません');
-    return;
-  }
-
-  Logger.log('[監視列の確認・追加]');
-  const colMap = ensureAnomalyColumns_(eBayLog);
-  ANOMALY_MONITOR_HEADERS_.forEach(function(name) {
-    Logger.log('  ' + name + ' → 列' + colMap[name]);
-  });
-  Logger.log('');
-
-  const allData = eBayLog.getDataRange().getValues();
-  Logger.log('[eBay受注ログ スキャン]');
-  Logger.log('  総行数（ヘッダー含む）: ' + allData.length);
-  Logger.log('');
-
-  let checkedCount = 0;
-  let anomalyCount = 0;
-  let notifyCount  = 0;
-  let errorCount   = 0;
-
-  const anomalyRowsToNotify = [];
-
-  for (let i = 1; i < allData.length; i++) {
-    const row     = allData[i];
-    const orderId = String(row[ANOMALY_COL_.ORDER_ID] || '').trim();
-    if (!orderId) continue;
-
-    checkedCount++;
-    const sku = String(row[ANOMALY_COL_.SKU] || '').trim();
-
-    try {
-      const judgment = getMcfAnomalyJudgment_(row);
-      const sheetRow = i + 1;
-
-      // ── 監視列に書き込み ──────────────────────────────────
-      eBayLog.getRange(sheetRow, colMap['MCF監視判定']    ).setValue(judgment.level);
-      eBayLog.getRange(sheetRow, colMap['MCF監視理由']    ).setValue(judgment.reason);
-      eBayLog.getRange(sheetRow, colMap['MCF経過時間']    ).setValue(judgment.mcfElapsedStr);
-      eBayLog.getRange(sheetRow, colMap['発送期限残り時間']).setValue(judgment.deadlineRemaining);
-      eBayLog.getRange(sheetRow, colMap['MCF通知レベル']  ).setValue(judgment.level);
-
-      // ── MCF監視判定セルに色をつける ────────────────────────
-      const levelCell = eBayLog.getRange(sheetRow, colMap['MCF監視判定']);
-      switch (judgment.level) {
-        case '危険' : levelCell.setBackground('#fce8e6').setFontColor('#c5221f'); break;
-        case '警告' : levelCell.setBackground('#fef7e0').setFontColor('#e37400'); break;
-        case '注意' : levelCell.setBackground('#e8f0fe').setFontColor('#1a73e8'); break;
-        case '正常' : levelCell.setBackground('#e6f4ea').setFontColor('#137333'); break;
-        case '対象外': levelCell.setBackground('#f1f3f4').setFontColor('#5f6368'); break;
-      }
-
-      // ── Logger 出力 ────────────────────────────────────────
-      const symbol = { '危険':'🔴', '警告':'🟡', '注意':'🔵', '正常':'✅', '対象外':'⏭ ' };
-      Logger.log('  ' + (symbol[judgment.level] || '  ') + ' 行' + sheetRow
-        + ' [' + judgment.level + '] ' + orderId);
-      if (judgment.level !== '正常' && judgment.level !== '対象外') {
-        Logger.log('     ' + judgment.reason);
-      }
-
-      // ── 異常カウント ──────────────────────────────────────
-      if (['注意', '警告', '危険'].includes(judgment.level)) {
-        anomalyCount++;
-      }
-
-      // ── メール通知の要否判断 ──────────────────────────────
-      if (['注意', '警告', '危険'].includes(judgment.level)) {
-        const alreadyNotified = String(
-          row[colMap['MCF通知済み'] - 1] || ''
-        ).trim();
-
-        if (shouldSendEmail_(alreadyNotified, judgment.level)) {
-          const nowStr = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss');
-          eBayLog.getRange(sheetRow, colMap['MCF通知済み']    ).setValue(judgment.level);
-          eBayLog.getRange(sheetRow, colMap['MCF最終通知日時']).setValue(nowStr);
-
-          anomalyRowsToNotify.push({
-            rowNum           : sheetRow,
-            orderId          : orderId,
-            sku              : sku,
-            level            : judgment.level,
-            reason           : judgment.reason,
-            mcfElapsedStr    : judgment.mcfElapsedStr,
-            deadlineRemaining: judgment.deadlineRemaining
-          });
-
-          Logger.log('     → メール通知対象（前回: "' + alreadyNotified + '" → 今回: "' + judgment.level + '"）');
-        } else if (alreadyNotified === judgment.level) {
-          Logger.log('     → 通知スキップ（同レベル "' + judgment.level + '" 通知済み）');
-        }
-      }
-
-    } catch (e) {
-      Logger.log('  ❌ 行' + (i + 1) + ' 処理エラー: ' + e.toString());
-      errorCount++;
-    }
-  }
-
-  // ── メール送信 ─────────────────────────────────────────────
-  Logger.log('');
-  if (anomalyRowsToNotify.length > 0) {
-    try {
-      sendAnomalyEmail_(anomalyRowsToNotify);
-      notifyCount = anomalyRowsToNotify.length;
-      Logger.log('✅ メール通知送信完了 → ' + ANOMALY_NOTIFY_EMAIL_);
-      Logger.log('   通知件数: ' + notifyCount + ' 件');
-    } catch (e) {
-      Logger.log('❌ メール送信エラー: ' + e.toString());
-      errorCount++;
-    }
-  } else {
-    Logger.log('ℹ️ メール通知対象なし（新規・レベルアップなし）');
-  }
-
-  // ── MCF監視ログに記録 ──────────────────────────────────────
-  try {
-    logAnomalyMonitorResult_(ss, checkedCount, notifyCount, errorCount, anomalyCount);
-    Logger.log('✅ MCF監視ログに記録しました');
-  } catch (e) {
-    Logger.log('⚠️ MCF監視ログ記録エラー: ' + e.toString());
-  }
-
-  // ── Loggerサマリー ─────────────────────────────────────────
-  Logger.log('');
-  Logger.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  Logger.log('【サマリー】');
-  Logger.log('  判定対象件数    : ' + checkedCount + ' 件');
-  Logger.log('  異常件数（合計）: ' + anomalyCount + ' 件（注意+警告+危険）');
-  Logger.log('  メール通知件数  : ' + notifyCount  + ' 件');
-  Logger.log('  エラー件数      : ' + errorCount   + ' 件');
-  Logger.log('');
-  Logger.log('  ★ 既存列（A〜U）は変更しませんでした');
-  Logger.log('  ★ MCF作成API・eBay提出APIは呼びませんでした');
-  Logger.log('  ★ 既存トリガーは変更しませんでした');
-  Logger.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  Logger.log('');
-}
-
 // ============================================================
 // ■ 判定ロジック補足（v2）
 // ============================================================
@@ -12554,4 +12403,453 @@ function handleInventoryApproval_(decision, replyToken) {
     replyToLine(replyToken, '在庫変更を破棄しました（' + count + '件）。');
     Logger.log('在庫承認: 破棄に変更 ' + count + '件');
   }
+}
+
+/* ===================================================================
+ * MCF_AnomalyMonitor_v3.gs
+ * -------------------------------------------------------------------
+ * v2からの変更点：
+ *   1. メール → LINE通知化（ON/OFFスイッチ付き）
+ *   2. 種別・レベル分離（MCF未作成 と Tracking未取得 を別々に判定）
+ *      → MCF通知済み種別 列を新規追加（AC列）
+ *      → 通知キー = 「種別|レベル」（例：MCF未作成|注意）
+ *
+ * 通知条件（v3）：
+ *   ・未通知の異常         → 通知
+ *   ・種別が変化           → 同じレベルでも通知
+ *   ・同じ種別でレベル上昇 → 通知
+ *   ・同じ種別・同じレベル → 通知しない
+ *   ・正常復帰後の再発     → 通知（種別・レベルをリセットするため）
+ *
+ * 切替関数：
+ *   setMcfAnomalyNotifyLine()        // LINEのみ（デフォルト）
+ *   setMcfAnomalyNotifyEmail()       // メールのみ
+ *   setMcfAnomalyNotifyBoth()        // LINEとメール
+ *   disableMcfAnomalyNotifications() // 通知停止
+ *
+ * 実行：
+ *   runMcfAnomalyMonitor()       // 本番
+ *   auditMcfAnomalyNotifyMode()  // 現在のモード確認
+ *   testMcfAnomalyNotification() // テスト通知
+ * =================================================================== */
+
+// ============================================================
+// ■ 定数
+// ============================================================
+
+
+/* ===================================================================
+ * MCF_AnomalyMonitor_v3.gs  ── 追記専用（定数は既存を流用）
+ * -------------------------------------------------------------------
+ * v2からの変更点：
+ *   1. メール → LINE通知化（ON/OFFスイッチ付き）
+ *   2. 種別・レベル分離（MCF未作成 と Tracking未取得 を別々に判定）
+ *      MCF通知済み種別 列を新規追加（AC列）
+ *
+ * ★ ANOMALY_NOTIFY_EMAIL_ / ANOMALY_COL_ / ANOMALY_MONITOR_HEADERS_ /
+ *   ANOMALY_LEVEL_PRIORITY_ / ANOMALY_THRESHOLD_ / ANOMALY_EBAY_LOG_SHEET_ /
+ *   ANOMALY_LOG_SHEET_NAME_ は既存コードに定義済みのため、ここでは宣言しない。
+ *
+ * 通知条件（v3）：
+ *   未通知の異常         → 通知
+ *   種別が変化           → 同レベルでも通知
+ *   同じ種別でレベル上昇 → 通知
+ *   同じ種別・同じレベル → 通知しない
+ *   正常復帰後の再発     → 通知（種別・レベルをリセット済みのため）
+ *
+ * 切替関数：
+ *   setMcfAnomalyNotifyLine()        LINEのみ（デフォルト）
+ *   setMcfAnomalyNotifyEmail()       メールのみ
+ *   setMcfAnomalyNotifyBoth()        LINEとメール
+ *   disableMcfAnomalyNotifications() 通知停止
+ *
+ * 実行：
+ *   runMcfAnomalyMonitor()       本番（v3で上書き）
+ *   auditMcfAnomalyNotifyMode()  現在モード確認
+ *   testMcfAnomalyNotification() テスト通知
+ * =================================================================== */
+
+// ============================================================
+// ■ v3 専用定数（既存と重複しないもののみ）
+// ============================================================
+
+var ANOMALY_NOTIFY_MODE_KEY_ = 'MCF_ANOMALY_NOTIFY_MODE';
+
+var ANOMALY_NOTIFY_MODE_ = {
+  LINE  : 'LINE',
+  EMAIL : 'EMAIL',
+  BOTH  : 'BOTH',
+  OFF   : 'OFF'
+};
+
+var ANOMALY_TYPE_ = {
+  MCF_NOT_CREATED  : 'MCF未作成',
+  TRACKING_MISSING : 'TRACKING未取得',
+  NORMAL           : '正常',
+  OUT_OF_SCOPE     : '対象外'
+};
+
+// ANOMALY_MONITOR_HEADERS_ は既存に定義済みだが、
+// v3 で AC列（MCF通知済み種別）を追加するため、
+// ensureAnomalyColumns_v3_ で個別に追加する。
+var ANOMALY_V3_EXTRA_HEADER_ = 'MCF通知済み種別';
+
+
+// ============================================================
+// ■ 通知モード切替
+// ============================================================
+
+function setMcfAnomalyNotifyLine() {
+  PropertiesService.getScriptProperties()
+    .setProperty(ANOMALY_NOTIFY_MODE_KEY_, ANOMALY_NOTIFY_MODE_.LINE);
+  Logger.log('MCF異常通知モードを LINE に変更しました。');
+}
+
+function setMcfAnomalyNotifyEmail() {
+  PropertiesService.getScriptProperties()
+    .setProperty(ANOMALY_NOTIFY_MODE_KEY_, ANOMALY_NOTIFY_MODE_.EMAIL);
+  Logger.log('MCF異常通知モードを EMAIL に変更しました。');
+}
+
+function setMcfAnomalyNotifyBoth() {
+  PropertiesService.getScriptProperties()
+    .setProperty(ANOMALY_NOTIFY_MODE_KEY_, ANOMALY_NOTIFY_MODE_.BOTH);
+  Logger.log('MCF異常通知モードを BOTH（LINE＋メール）に変更しました。');
+}
+
+function disableMcfAnomalyNotifications() {
+  PropertiesService.getScriptProperties()
+    .setProperty(ANOMALY_NOTIFY_MODE_KEY_, ANOMALY_NOTIFY_MODE_.OFF);
+  Logger.log('MCF異常通知を停止しました（OFF）。');
+}
+
+function auditMcfAnomalyNotifyMode() {
+  var mode = PropertiesService.getScriptProperties()
+    .getProperty(ANOMALY_NOTIFY_MODE_KEY_) || 'LINE';
+  Logger.log('MCF異常通知モード: ' + mode);
+}
+
+function testMcfAnomalyNotification() {
+  _anomalySendNotification_([{
+    orderId          : 'TEST-ORDER',
+    sku              : 'TEST-SKU',
+    level            : '注意',
+    type             : 'MCF未作成',
+    reason           : 'テスト送信',
+    mcfElapsedStr    : '-',
+    deadlineRemaining: '-'
+  }]);
+  Logger.log('MCF異常通知テスト送信完了');
+}
+
+
+// ============================================================
+// ■ ensureAnomalyColumnsV3_
+//   既存の監視列に加えて、MCF通知済み種別（AC列）を追加
+// ============================================================
+
+function ensureAnomalyColumnsV3_(sheet) {
+  // まず既存の ensureAnomalyColumns_ を呼んで既存列を作る
+  var colMap = ensureAnomalyColumns_(sheet);
+
+  // MCF通知済み種別 が無ければ追加
+  if (!colMap[ANOMALY_V3_EXTRA_HEADER_]) {
+    var lastCol = sheet.getLastColumn();
+    sheet.getRange(1, lastCol + 1).setValue(ANOMALY_V3_EXTRA_HEADER_);
+    var hdr = sheet.getRange(1, lastCol + 1);
+    hdr.setBackground('#e8eaf6');
+    hdr.setFontWeight('bold');
+    sheet.setColumnWidth(lastCol + 1, 120);
+    colMap[ANOMALY_V3_EXTRA_HEADER_] = lastCol + 1;
+  }
+
+  return colMap;
+}
+
+
+// ============================================================
+// ■ getMcfAnomalyJudgmentV3_（type を追加した判定関数）
+// ============================================================
+
+function getMcfAnomalyJudgmentV3_(row) {
+  var now = new Date();
+
+  var orderId     = String(row[ANOMALY_COL_.ORDER_ID]    || '').trim();
+  var receivedRaw = row[ANOMALY_COL_.RECEIVED_AT];
+  var shipByRaw   = row[ANOMALY_COL_.SHIP_BY];
+  var mcfId       = String(row[ANOMALY_COL_.MCF_ID]      || '').trim();
+  var status      = String(row[ANOMALY_COL_.STATUS]      || '').trim();
+  var tracking    = String(row[ANOMALY_COL_.TRACKING]    || '').trim();
+  var trackingSts = String(row[ANOMALY_COL_.TRACKING_STS]|| '').trim();
+
+  if (!orderId || orderId === 'eBay注文番号') return null;
+
+  // 除外条件
+  if (tracking) {
+    return { level: '対象外', type: ANOMALY_TYPE_.OUT_OF_SCOPE,
+             reason: 'Tracking取得済み', mcfElapsedStr: '', deadlineRemaining: '' };
+  }
+  if (trackingSts === '追跡番号取得済' || trackingSts === 'チェック不要') {
+    return { level: '対象外', type: ANOMALY_TYPE_.OUT_OF_SCOPE,
+             reason: trackingSts, mcfElapsedStr: '', deadlineRemaining: '' };
+  }
+  if (status === '手動対応済み') {
+    return { level: '対象外', type: ANOMALY_TYPE_.OUT_OF_SCOPE,
+             reason: '手動対応済み', mcfElapsedStr: '', deadlineRemaining: '' };
+  }
+
+  // 受注日時パース
+  var receivedAt = null;
+  try {
+    receivedAt = (receivedRaw instanceof Date) ? receivedRaw : (receivedRaw ? new Date(String(receivedRaw)) : null);
+  } catch (e) {}
+
+  // 発送期限パース
+  var shipBy = null;
+  try {
+    shipBy = (shipByRaw instanceof Date) ? shipByRaw : (shipByRaw ? new Date(String(shipByRaw)) : null);
+  } catch (e) {}
+
+  var hoursToDeadline = null;
+  var deadlineRemaining = '';
+  if (shipBy && !isNaN(shipBy.getTime())) {
+    hoursToDeadline = (shipBy.getTime() - now.getTime()) / (1000 * 60 * 60);
+    deadlineRemaining = hoursToDeadline >= 0
+      ? '残り' + hoursToDeadline.toFixed(1) + 'h'
+      : '超過' + Math.abs(hoursToDeadline).toFixed(1) + 'h';
+  }
+
+  // 判定A：MCF未作成
+  if (!mcfId && status === '受注済') {
+    var hoursFromOrder = null;
+    var mcfElapsedStr = '';
+    if (receivedAt && !isNaN(receivedAt.getTime())) {
+      hoursFromOrder = (now.getTime() - receivedAt.getTime()) / (1000 * 60 * 60);
+      mcfElapsedStr = '受注後' + hoursFromOrder.toFixed(1) + 'h';
+    }
+    if (hoursFromOrder === null) {
+      return { level: '正常', type: ANOMALY_TYPE_.NORMAL,
+               reason: '受注日時不明', mcfElapsedStr: '', deadlineRemaining: deadlineRemaining };
+    }
+    var levelA = '正常';
+    if      (hoursFromOrder > ANOMALY_THRESHOLD_.MCF_NOT_CREATED_DANGER)  levelA = '危険';
+    else if (hoursFromOrder > ANOMALY_THRESHOLD_.MCF_NOT_CREATED_WARNING) levelA = '警告';
+    else if (hoursFromOrder > ANOMALY_THRESHOLD_.MCF_NOT_CREATED_CAUTION) levelA = '注意';
+    if (levelA === '正常') {
+      return { level: '正常', type: ANOMALY_TYPE_.NORMAL,
+               reason: 'MCF未作成だが' + mcfElapsedStr + '（基準内）',
+               mcfElapsedStr: mcfElapsedStr, deadlineRemaining: deadlineRemaining };
+    }
+    return { level: levelA, type: ANOMALY_TYPE_.MCF_NOT_CREATED,
+             reason: 'MCF未作成・' + mcfElapsedStr + '経過',
+             mcfElapsedStr: mcfElapsedStr, deadlineRemaining: deadlineRemaining };
+  }
+
+  // 判定B：Tracking未取得
+  if (mcfId && !tracking) {
+    if (hoursToDeadline === null) {
+      return { level: '正常', type: ANOMALY_TYPE_.NORMAL,
+               reason: '発送期限不明・判定不能', mcfElapsedStr: '', deadlineRemaining: '' };
+    }
+    var levelB = '正常';
+    if      (hoursToDeadline <= 0)                                        levelB = '危険';
+    else if (hoursToDeadline <= ANOMALY_THRESHOLD_.TRACKING_DANGER)       levelB = '危険';
+    else if (hoursToDeadline <= ANOMALY_THRESHOLD_.TRACKING_WARNING)      levelB = '警告';
+    else if (hoursToDeadline <= ANOMALY_THRESHOLD_.TRACKING_CAUTION)      levelB = '注意';
+    if (levelB === '正常') {
+      return { level: '正常', type: ANOMALY_TYPE_.NORMAL,
+               reason: 'Tracking待ち・期限まで' + hoursToDeadline.toFixed(1) + 'h（基準内）',
+               mcfElapsedStr: '', deadlineRemaining: deadlineRemaining };
+    }
+    return { level: levelB, type: ANOMALY_TYPE_.TRACKING_MISSING,
+             reason: 'Tracking未取得・期限' + (hoursToDeadline >= 0
+               ? 'まで' + hoursToDeadline.toFixed(1) + 'h'
+               : '超過' + Math.abs(hoursToDeadline).toFixed(1) + 'h'),
+             mcfElapsedStr: '', deadlineRemaining: deadlineRemaining };
+  }
+
+  return { level: '正常', type: ANOMALY_TYPE_.NORMAL,
+           reason: '対象外または正常', mcfElapsedStr: '', deadlineRemaining: deadlineRemaining };
+}
+
+
+// ============================================================
+// ■ shouldNotifyV3_（種別・レベル両方で判定）
+// ============================================================
+
+function shouldNotifyV3_(prevLevel, prevType, newLevel, newType) {
+  if (newLevel === '正常' || newLevel === '対象外') return false;
+  if (!prevLevel || !prevType) return true;
+  if (prevType !== newType) return true;
+  var prevPri = ANOMALY_LEVEL_PRIORITY_[prevLevel] || 0;
+  var newPri  = ANOMALY_LEVEL_PRIORITY_[newLevel]  || 0;
+  return newPri > prevPri;
+}
+
+
+// ============================================================
+// ■ _anomalySendNotification_（LINE/メール/両方/OFF）
+// ============================================================
+
+function _anomalySendNotification_(rows) {
+  if (!rows || rows.length === 0) return;
+
+  var mode = PropertiesService.getScriptProperties()
+    .getProperty(ANOMALY_NOTIFY_MODE_KEY_) || 'LINE';
+
+  if (mode === 'OFF') {
+    Logger.log('通知モード: OFF → 送信スキップ');
+    return;
+  }
+
+  if (mode === 'LINE' || mode === 'BOTH') {
+    var msg = '⚠️ MCF異常通知（' + rows.length + '件）\n━━━━━━━━━━━━━━━\n';
+    rows.forEach(function(r, i) {
+      msg += (i + 1) + '. [' + r.level + '] ' + r.type + '\n'
+           + '   注文: ' + r.orderId + '\n'
+           + '   SKU: ' + r.sku + '\n'
+           + '   ' + r.reason + '\n';
+      if (r.mcfElapsedStr)     msg += '   経過: ' + r.mcfElapsedStr + '\n';
+      if (r.deadlineRemaining) msg += '   期限: ' + r.deadlineRemaining + '\n';
+      if (i < rows.length - 1) msg += '───\n';
+    });
+    sendLine(msg);  // 既存の sendLine を使用
+    Logger.log('LINE通知送信完了（' + rows.length + '件）');
+  }
+
+  if (mode === 'EMAIL' || mode === 'BOTH') {
+    var subject = '【MCF異常監視】' + rows.length + '件の異常を検出';
+    var body = 'MCF異常監視 v3\n\n';
+    rows.forEach(function(r, i) {
+      body += '--- [' + (i + 1) + '] ' + r.level + ' ---\n'
+            + '注文: ' + r.orderId + '\n'
+            + 'SKU: ' + r.sku + '\n'
+            + '種別: ' + r.type + '\n'
+            + '理由: ' + r.reason + '\n';
+      if (r.mcfElapsedStr)     body += '経過: ' + r.mcfElapsedStr + '\n';
+      if (r.deadlineRemaining) body += '期限: ' + r.deadlineRemaining + '\n';
+      body += '\n';
+    });
+    MailApp.sendEmail({ to: ANOMALY_NOTIFY_EMAIL_, subject: subject, body: body });
+    Logger.log('メール通知送信完了（' + rows.length + '件）');
+  }
+}
+
+
+// ============================================================
+// ■ runMcfAnomalyMonitor（v3で上書き）
+// ============================================================
+
+function runMcfAnomalyMonitor() {
+  var now = new Date();
+  Logger.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  Logger.log('【runMcfAnomalyMonitor v3】LINE通知＋種別分離');
+  Logger.log('  実行日時: ' + Utilities.formatDate(now, 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss'));
+  Logger.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+
+  var mode = PropertiesService.getScriptProperties()
+    .getProperty(ANOMALY_NOTIFY_MODE_KEY_) || 'LINE';
+  Logger.log('  通知モード: ' + mode);
+  Logger.log('');
+
+  var ss      = SpreadsheetApp.getActiveSpreadsheet();
+  var eBayLog = ss.getSheetByName(ANOMALY_EBAY_LOG_SHEET_);
+  if (!eBayLog) { Logger.log('❌ eBay受注ログ シートなし'); return; }
+
+  var colMap  = ensureAnomalyColumnsV3_(eBayLog);
+  var allData = eBayLog.getDataRange().getValues();
+
+  var checkedCount = 0, anomalyCount = 0, notifyCount = 0, errorCount = 0;
+  var rowsToNotify = [];
+
+  for (var i = 1; i < allData.length; i++) {
+    var row     = allData[i];
+    var orderId = String(row[ANOMALY_COL_.ORDER_ID] || '').trim();
+    if (!orderId) continue;
+
+    checkedCount++;
+    var sku = String(row[ANOMALY_COL_.SKU] || '').trim();
+
+    try {
+      var judgment = getMcfAnomalyJudgmentV3_(row);
+      if (!judgment) continue;
+
+      var sheetRow = i + 1;
+
+      // 監視列に書き込み
+      eBayLog.getRange(sheetRow, colMap['MCF監視判定']    ).setValue(judgment.level);
+      eBayLog.getRange(sheetRow, colMap['MCF監視理由']    ).setValue(judgment.reason);
+      eBayLog.getRange(sheetRow, colMap['MCF経過時間']    ).setValue(judgment.mcfElapsedStr);
+      eBayLog.getRange(sheetRow, colMap['発送期限残り時間']).setValue(judgment.deadlineRemaining);
+      eBayLog.getRange(sheetRow, colMap['MCF通知レベル']  ).setValue(judgment.level);
+
+      // 正常復帰時 → 種別・レベルをリセット（最終通知日時は残す）
+      if (judgment.level === '正常' || judgment.level === '対象外') {
+        var prevNotified = String(row[colMap['MCF通知済み'] - 1] || '').trim();
+        if (prevNotified) {
+          eBayLog.getRange(sheetRow, colMap['MCF通知済み']         ).setValue('');
+          eBayLog.getRange(sheetRow, colMap[ANOMALY_V3_EXTRA_HEADER_]).setValue('');
+        }
+      }
+
+      // セルに色
+      var levelCell = eBayLog.getRange(sheetRow, colMap['MCF監視判定']);
+      switch (judgment.level) {
+        case '危険' : levelCell.setBackground('#fce8e6').setFontColor('#c5221f'); break;
+        case '警告' : levelCell.setBackground('#fef7e0').setFontColor('#e37400'); break;
+        case '注意' : levelCell.setBackground('#e8f0fe').setFontColor('#1a73e8'); break;
+        case '正常' : levelCell.setBackground('#e6f4ea').setFontColor('#137333'); break;
+        case '対象外': levelCell.setBackground('#f1f3f4').setFontColor('#5f6368'); break;
+      }
+
+      if (['注意', '警告', '危険'].indexOf(judgment.level) !== -1) {
+        anomalyCount++;
+        var prevLevel = String(row[colMap['MCF通知済み']              - 1] || '').trim();
+        var prevType  = String(row[colMap[ANOMALY_V3_EXTRA_HEADER_] - 1] || '').trim();
+
+        if (shouldNotifyV3_(prevLevel, prevType, judgment.level, judgment.type)) {
+          rowsToNotify.push({
+            sheetRow: sheetRow, orderId: orderId, sku: sku,
+            level: judgment.level, type: judgment.type,
+            reason: judgment.reason,
+            mcfElapsedStr: judgment.mcfElapsedStr,
+            deadlineRemaining: judgment.deadlineRemaining
+          });
+          Logger.log('  ⚠️ 行' + sheetRow + ' [' + judgment.level + '] ' + judgment.type + ' / ' + orderId);
+        } else {
+          Logger.log('  ⏭  行' + sheetRow + ' スキップ（' + prevType + '|' + prevLevel + ' → ' + judgment.type + '|' + judgment.level + '）');
+        }
+      }
+
+    } catch (e) {
+      Logger.log('  ❌ 行' + (i + 1) + ' エラー: ' + e.toString());
+      errorCount++;
+    }
+  }
+
+  // 通知送信（失敗時は通知済み列を更新しない）
+  Logger.log('');
+  if (rowsToNotify.length > 0) {
+    try {
+      _anomalySendNotification_(rowsToNotify);
+      var nowStr = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss');
+      rowsToNotify.forEach(function(r) {
+        eBayLog.getRange(r.sheetRow, colMap['MCF通知済み']              ).setValue(r.level);
+        eBayLog.getRange(r.sheetRow, colMap[ANOMALY_V3_EXTRA_HEADER_]  ).setValue(r.type);
+        eBayLog.getRange(r.sheetRow, colMap['MCF最終通知日時']          ).setValue(nowStr);
+      });
+      notifyCount = rowsToNotify.length;
+    } catch (e) {
+      Logger.log('❌ 通知失敗 → 通知済み列は更新しません（次回再試行）: ' + e);
+      errorCount++;
+    }
+  } else {
+    Logger.log('ℹ️ 通知対象なし');
+  }
+
+  try { logAnomalyMonitorResult_(ss, checkedCount, notifyCount, errorCount, anomalyCount); } catch (e) {}
+
+  Logger.log('');
+  Logger.log('【サマリー】判定:' + checkedCount + ' 異常:' + anomalyCount + ' 通知:' + notifyCount + ' エラー:' + errorCount + ' モード:' + mode);
+  Logger.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
 }
