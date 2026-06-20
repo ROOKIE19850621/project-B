@@ -12518,3 +12518,4 @@ function setupDailyInventoryApprovalTrigger() {
 }
 
 //テスト前
+//テスト後
