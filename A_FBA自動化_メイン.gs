@@ -27,6 +27,7 @@
 var SORYO_SHEET_ID = '1xJ8PiYwv_T_FVLEXBUi1Fs8MYqAav7CjknzqieLhbkg';  // FBA送料一覧
 var HASSO_SHEET_ID = '1l6Vs-5el4-N3xe0msWoqOTWAg6J_RAARtvVJF73VdsE'; // そー草加ファイル
 var HASSO_SHEET_NAME = '発送G';
+var EXPIRY_UPLOAD_ENABLED = false;  // false=賞味期限OCR停止 / true=再開
 
 // ============================================================
 // Webhook受信
@@ -53,6 +54,10 @@ function doPost(e) {
 
     // ===== 画像メッセージ → 賞味期限OCR =====
     if (event.message.type === 'image') {
+      if (!EXPIRY_UPLOAD_ENABLED) {
+        replyToLine(event.replyToken, '賞味期限の読み取りは現在停止中です。');
+        return output;
+      }
       console.log('→ 賞味期限画像を受信');
       handleExpiryImage(event.message.id, event.replyToken);
       return output;
@@ -131,6 +136,17 @@ function doPost(e) {
     // ========================================================
 
     console.log('→ Claude解析開始');
+
+// ===== 在庫承認（進めて / 停めて）=====
+    if (userMessage === '進めてください' || userMessage === '進めて') {
+      handleInventoryApproval_('進める', replyToken);
+      return output;
+    }
+    if (userMessage === '停めてください' || userMessage === '停めて' ||
+        userMessage === '止めてください' || userMessage === '止めて') {
+      handleInventoryApproval_('停める', replyToken);
+      return output;
+    }
 
     var dims = parseDimensionsWithClaude(userMessage);
 
@@ -1434,6 +1450,17 @@ function doPost(e) {
     // ========================================================
 
     console.log('→ Claude解析開始');
+
+// ===== 在庫承認（進めて / 停めて）=====
+    if (userMessage === '進めてください' || userMessage === '進めて') {
+      handleInventoryApproval_('進める', replyToken);
+      return output;
+    }
+    if (userMessage === '停めてください' || userMessage === '停めて' ||
+        userMessage === '止めてください' || userMessage === '止めて') {
+      handleInventoryApproval_('停める', replyToken);
+      return output;
+    }
 
     var dims = parseDimensionsWithClaude(userMessage);
 
