@@ -12118,8 +12118,8 @@ function _apvNum_(v) {
  * 結果は「eBay在庫承認」シートの H/I/J/K に書き戻す。
  * =================================================================== */
 
-var INVENTORY_EXEC_DRYRUN  = true;   // ★まずは true（プレビュー）
-var INVENTORY_EXEC_ENABLED = false;  // ★まずは false（本番停止）
+var INVENTORY_EXEC_DRYRUN  = false;   // ★まずは true（プレビュー）
+var INVENTORY_EXEC_ENABLED = true;  // ★まずは false（本番停止）
 var INVENTORY_EXEC_LIMIT   = 5;      // 1回の上限
 
 // 承認シートの列（Stage1と同じ）
@@ -12335,17 +12335,19 @@ function dailyInventoryApprovalNotify() {
     return;
   }
 
-  // 4) LINEを1通だけ送る
+// 4) Slackに1通だけ送る
   var msg =
-    '📦 eBay在庫 承認待ち\n' +
+    '<!channel> 📦 eBay在庫 承認待ち\n' +
     '0→1（出品再開）: ' + to1 + '件\n' +
     '1→0（在庫切れ）: ' + to0 + '件\n\n' +
-    '「進めてください」で実行\n' +
-    '「停めてください」で破棄\n\n' +
-    '（詳細は「' + APPROVAL_SHEET_NAME + '」シート）';
+    '▼承認の手順\n' +
+    '1.「' + APPROVAL_SHEET_NAME + '」シートを開く\n' +
+    '2. 承認する行のH列「状態」を「承認済」にする\n' +
+    '3. executeApprovedInventory_RUN を実行\n' +
+    '（破棄する行は「破棄」にするか、そのまま放置）';
 
-  sendLine(msg);
-  Logger.log('LINE通知送信: 0→1=' + to1 + ' / 1→0=' + to0);
+  _sendSlackWithButtons_(to1, to0);
+  Logger.log('Slack通知送信: 0→1=' + to1 + ' / 1→0=' + to0);
 }
 
 
@@ -12854,4 +12856,111 @@ function runMcfAnomalyMonitor() {
   Logger.log('');
   Logger.log('【サマリー】判定:' + checkedCount + ' 異常:' + anomalyCount + ' 通知:' + notifyCount + ' エラー:' + errorCount + ' モード:' + mode);
   Logger.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+}
+
+/** Slackに通知を送る（Incoming Webhook）。URLはScriptプロパティ SLACK_WEBHOOK_URL に保存。 */
+function sendSlack(message) {
+  var url = PropertiesService.getScriptProperties().getProperty('SLACK_WEBHOOK_URL');
+  if (!url) {
+    Logger.log('❌ SLACK_WEBHOOK_URL 未設定');
+    return;
+  }
+  try {
+    UrlFetchApp.fetch(url, {
+      method: 'post',
+      contentType: 'application/json',
+      payload: JSON.stringify({ text: message }),
+      muteHttpExceptions: true
+    });
+  } catch (e) {
+    Logger.log('Slack送信失敗: ' + e);
+  }
+}
+
+function testSlackNow() {
+  sendSlack('✅ Slack配信テスト ' + new Date());
+}
+
+function doPost(e) {
+  try {
+    var payload = JSON.parse(e.parameter.payload);
+    var actionId = payload.actions[0].action_id;
+    var responseUrl = payload.response_url;
+    if (actionId === 'approve_inventory') {
+      handleInventoryApprovalSlack_('進める', responseUrl);
+    } else if (actionId === 'reject_inventory') {
+      handleInventoryApprovalSlack_('停める', responseUrl);
+    }
+  } catch (err) {
+    Logger.log('doPost エラー: ' + err);
+  }
+  return ContentService.createTextOutput('OK');
+}
+
+function handleInventoryApprovalSlack_(decision, responseUrl) {
+  var ss = SpreadsheetApp.openById('1exGBAEx99-2Qc9d0DLRiZbygvgIo4FY_NoBG3Nkan-A');
+  var sheet = ss.getSheetByName('eBay在庫承認');
+  if (!sheet) { _slackReply_(responseUrl, '❌ シートが見つかりません。'); return; }
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) { _slackReply_(responseUrl, '⚠️ 承認待ちはありません。'); return; }
+  var range = sheet.getRange(2, 8, lastRow - 1, 1);
+  var statuses = range.getValues();
+  var newStatus = (decision === '進める') ? '承認済' : '破棄';
+  var count = 0;
+  for (var i = 0; i < statuses.length; i++) {
+    if (String(statuses[i][0] == null ? '' : statuses[i][0]).trim() === '承認待ち') {
+      statuses[i][0] = newStatus;
+      count++;
+    }
+  }
+  range.setValues(statuses);
+  if (decision === '進める') {
+    _slackReply_(responseUrl, '✅ 承認しました（' + count + '件）。eBay在庫を変更します...');
+    executeApprovedInventory_RUN();
+    _slackReply_(responseUrl, '✅ 完了しました（' + count + '件）。「eBay在庫承認」シートを確認してください。');
+  } else {
+    _slackReply_(responseUrl, '🚫 破棄しました（' + count + '件）。');
+  }
+}
+
+function _slackReply_(responseUrl, text) {
+  try {
+    UrlFetchApp.fetch(responseUrl, {
+      method: 'post',
+      contentType: 'application/json',
+      payload: JSON.stringify({ text: text, replace_original: false }),
+      muteHttpExceptions: true
+    });
+  } catch (e) {
+    Logger.log('Slack返信失敗: ' + e);
+  }
+}
+
+function _sendSlackWithButtons_(to1, to0) {
+  var url = PropertiesService.getScriptProperties().getProperty('SLACK_WEBHOOK_URL');
+  if (!url) { Logger.log('❌ SLACK_WEBHOOK_URL 未設定'); return; }
+  var body = {
+    blocks: [
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: '*<!channel> 📦 eBay在庫 承認待ち*\n0→1（出品再開）: ' + to1 + '件\n1→0（在庫切れ）: ' + to0 + '件'
+        }
+      },
+      {
+        type: 'actions',
+        elements: [
+          { type: 'button', text: { type: 'plain_text', text: '✅ 進める' }, style: 'primary', action_id: 'approve_inventory' },
+          { type: 'button', text: { type: 'plain_text', text: '🚫 停める' }, style: 'danger', action_id: 'reject_inventory' }
+        ]
+      }
+    ]
+  };
+  UrlFetchApp.fetch(url, {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify(body),
+    muteHttpExceptions: true
+  });
 }
