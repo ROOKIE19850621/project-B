@@ -5412,11 +5412,11 @@ if (v.sysAbnormal) {
 
     
 } else if (v.hasStockAlert) {
-      MailApp.sendEmail({
-        to: 'shinicchee@gmail.com',
-        subject: '📦 在庫アラート（在庫同期）',
-        body: _autoBuildStockAlertMessage_(v)
-      });
+      GmailApp.sendEmail(
+        'shinicchee@gmail.com',
+        '📦 在庫アラート（在庫同期）',
+        _autoBuildStockAlertMessage_(v)
+      );
 
     } else {
 
