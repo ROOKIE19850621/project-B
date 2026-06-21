@@ -2746,19 +2746,33 @@ function onOpen() {
   const ui = SpreadsheetApp.getUi();
 
   ui.createMenu('評価依頼_JP')
-    .addItem('認証設定チェック', 'checkReviewRequestProperties')
+    // ── 日常運用フロー（上から順に実行）──────────────────────
+    .addItem('① 注文一覧取得',          'fetchRecentFbaShippedOrders')
+    .addItem('② ASIN・商品名取得',      'fetchOrderItemsForReviewOrders')
+    .addItem('③ 返金メール取込',        'importRefundEmailsToExclusions')
+    .addItem('④ ドライラン実行',        'runReviewRequestDryRun')
+    .addItem('⑤ 送信候補一覧作成',      'buildReviewRequestCandidates')
+    .addItem('⑥ 送信対象プレビュー(OK)', 'previewApprovedSendable')
     .addSeparator()
-    .addItem('注文一覧取得', 'fetchRecentFbaShippedOrders')
-    .addItem('ASIN・商品名取得', 'fetchOrderItemsForReviewOrders')
-    .addItem('返金メール取込', 'importRefundEmailsToExclusions')
-    .addItem('ドライラン実行', 'runReviewRequestDryRun')
-    .addItem('送信候補一覧作成', 'buildReviewRequestCandidates')
-    .addItem('送信対象プレビュー(OK)', 'previewApprovedSendable')
-    .addItem('候補トレース診断', 'debugBuildCandidatesTrace')
+    .addItem('★ OK分だけ評価依頼を送信', 'sendApprovedReviewRequests')
     .addSeparator()
-    .addItem('■■■OK分だけ評価依頼送信', 'sendApprovedReviewRequests')
+    // ── 診断ツール（読み取り専用・副作用なし）──────────────
+    .addSubMenu(ui.createMenu('🔍 診断ツール')
+      .addItem('認証設定チェック',        'checkReviewRequestProperties')
+      .addItem('SP-API接続テスト',        'testSpApiOrdersConnection')
+      .addItem('候補トレース診断',        'debugBuildCandidatesTrace')
+      .addItem('返金メール調査(単一注文)', 'debugRefundEmailForOrder'))
+    // ── 手動オペレーション（個別対応）──────────────────────
+    .addSubMenu(ui.createMenu('🛠 手動オペレーション')
+      .addItem('返金取込(単一注文)',      'importRefundEmailForSingleOrder')
+      .addItem('強制除外(単一注文)',      'forceExcludeSingleOrder'))
+    // ── 初期セットアップ（初回のみ）────────────────────────
+    .addSubMenu(ui.createMenu('⚙ セットアップ')
+      .addItem('JP設定を強制適用',        'forceApplyJpReviewRequestSettings')
+      .addItem('トリガー設定',            'setupReviewRequestTriggers'))
     .addToUi();
 
+  // JP固有: FDA書類作成メニュー（従来どおり保持）
   ui.createMenu('ＦＤＡ書類作成')
     .addItem('メール情報取得', 'fetchEmailData')
     .addToUi();
@@ -3190,7 +3204,7 @@ function buildReviewRequestCandidates() {
 
   const sendable = getApprovedSendableCandidates_();
   if (sendable.length > 0) {
-    sendLineMessageIfConfigured_(`Amazon評価依頼 JP: 送信対象(OK) ${sendable.length}件\n${REVIEW_JP.spreadsheetUrl}`);
+    sendEmailNotification_(`Amazon評価依頼 JP: 送信対象(OK) ${sendable.length}件\n${REVIEW_JP.spreadsheetUrl}`); // ★修正: 未定義の sendLineMessageIfConfigured_ → 定義済み sendEmailNotification_ に統一
     log_('INFO', 'buildReviewRequestCandidates', '', `OK送信対象 ${sendable.length}件 → 通知`, {});
   } else {
     log_('INFO', 'buildReviewRequestCandidates', '', 'OK送信対象0件 → 通知スキップ', {});
@@ -3326,16 +3340,9 @@ function scheduledRunDryRunBatch()       { runReviewRequestDryRun(); }
 function scheduledBuildCandidates()      { buildReviewRequestCandidates(); }
 
 function setupReviewRequestTriggers() {
-  deleteReviewRequestTriggers_();
-  ScriptApp.newTrigger('scheduledFetchRecentOrders').timeBased().everyDays(1).atHour(0).nearMinute(5).create();
-  ScriptApp.newTrigger('scheduledFetchOrderItemsBatch').timeBased().everyDays(1).atHour(1).nearMinute(5).create();
-  ScriptApp.newTrigger('scheduledFetchOrderItemsBatch').timeBased().everyDays(1).atHour(2).nearMinute(5).create();
-  ScriptApp.newTrigger('scheduledFetchOrderItemsBatch').timeBased().everyDays(1).atHour(3).nearMinute(5).create();
-  ScriptApp.newTrigger('scheduledImportRefundEmails').timeBased().everyDays(1).atHour(4).nearMinute(5).create();
-  ScriptApp.newTrigger('scheduledRunDryRunBatch').timeBased().everyDays(1).atHour(5).nearMinute(5).create();
-  ScriptApp.newTrigger('scheduledRunDryRunBatch').timeBased().everyDays(1).atHour(6).nearMinute(5).create();
-  ScriptApp.newTrigger('scheduledBuildCandidates').timeBased().everyDays(1).atHour(6).nearMinute(45).create();
-  log_('INFO', 'setupReviewRequestTriggers', '', 'Created automatic triggers (scheduledXXX) excluding send', {});
+  // ★修正: 旧トリガー設定は廃止。最新の resetReviewRequestJpTriggers() に一本化。
+  // 時間割が二重定義で食い違う事故を防ぐため、本関数は新関数へ委譲する。
+  resetReviewRequestJpTriggers();
 }
 function deleteReviewRequestTriggers_() {
   const managed = new Set([
@@ -3509,8 +3516,36 @@ function getApprovedSendableCandidates_() {
 /** ★v8: ログ確認用（副作用なし）。実送信前の確認に使う。結果は実行ログへ出力。 */
 function previewApprovedSendable() {
   const list = getApprovedSendableCandidates_();
+
+  // ログ出力（従来どおり実行ログにも残す）
   list.forEach((c) => Logger.log('OK  ' + c.amazon_order_id + '  ' + (c.asin || '') + '  ' + (c.item_name || '')));
   Logger.log('=== 実送信対象(OK): ' + list.length + '件 ===');
+
+  // ポップアップ表示（手動実行時のみ。トリガー実行ではUIが取得できないため自動スキップ）
+  let ui;
+  try {
+    ui = SpreadsheetApp.getUi();
+  } catch (e) {
+    return; // トリガー等のバックグラウンド実行ではダイアログを出さずに終了
+  }
+
+  if (list.length === 0) {
+    ui.alert('送信対象プレビュー(OK)',
+      '実送信対象(OK)は 0 件です。\n\n' +
+      '「評価依頼_結果」シートの send_decision 列に OK を入力してから再度お試しください。',
+      ui.ButtonSet.OK);
+    return;
+  }
+
+  const MAX_SHOW = 50; // 一覧が長すぎる場合の表示上限
+  const shown = list.slice(0, MAX_SHOW).map((c, i) =>
+    (i + 1) + '. ' + c.amazon_order_id + '  ' + (c.asin || '') + '  ' + (c.item_name || '')
+  ).join('\n');
+  const more = list.length > MAX_SHOW ? '\n…ほか ' + (list.length - MAX_SHOW) + ' 件' : '';
+
+  ui.alert('送信対象プレビュー(OK)',
+    '実送信対象(OK): ' + list.length + ' 件\n\n' + shown + more,
+    ui.ButtonSet.OK);
 }
 
 /** ★v8: 候補抽出トレース（読み取り専用）。判定/集計/除外理由を 評価依頼_ログ とアラートへ出力。 */
