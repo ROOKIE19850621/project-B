@@ -5412,9 +5412,11 @@ if (v.sysAbnormal) {
 
     
 } else if (v.hasStockAlert) {
-      sendStockAlertMail_(
-        _autoBuildStockAlertMessage_(v)
-      );
+      MailApp.sendEmail({
+        to: 'shinicchee@gmail.com',
+        subject: '📦 在庫アラート（在庫同期）',
+        body: _autoBuildStockAlertMessage_(v)
+      });
 
     } else {
 
@@ -12003,11 +12005,11 @@ function detectInventoryApprovalCandidates_RUN() {
 
     // 0->1: eBay=0 かつ Amazon在庫が基準以上
     if (ebay === 0) {
-      var ok01 = (!isNaN(th) && th >= 1) ? (amz > th) : (amz >= 1);
+      var ok01 = (!isNaN(th) && th >= 1) ? (amz >= th) : (amz >= 1);
       if (ok01) { direction = '0→1'; target = 1; }
     }
     // 1->0: eBay>=1 かつ 基準>=1 かつ Amazon<基準
-    if (!direction && ebay >= 1 && !isNaN(th) && th >= 1 && amz <= th) {
+    if (!direction && ebay >= 1 && !isNaN(th) && th >= 1 && amz < th) {
       direction = '1→0'; target = 0;
     }
 
